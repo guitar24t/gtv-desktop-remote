@@ -222,6 +222,16 @@ export class AndroidTvCertStore {
       );
       return undefined;
     }
+    // Keys written by older releases (or adopted from legacy names by rename)
+    // kept the default world-readable mode; restrict them to the owner.
+    try {
+      await this.fs.chmod?.(keyPath, PRIVATE_FILE_MODE);
+    } catch (error) {
+      this.logger.warn('androidTvCertStore', 'Could not restrict private key permissions', {
+        certKey,
+        error: String(error),
+      });
+    }
     return pair;
   }
 

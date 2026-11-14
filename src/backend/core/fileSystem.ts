@@ -23,6 +23,8 @@ export interface IFileSystem {
   /** Recursive best-effort delete; used by `bridge.reset()`. */
   rmRecursive(target: string): Promise<void>;
   rename(from: string, to: string): Promise<void>;
+  /** Sets permission bits. Optional so lightweight test doubles can omit it. */
+  chmod?(filePath: string, mode: number): Promise<void>;
   /** Returns true iff the path exists. Never throws. */
   exists(filePath: string): Promise<boolean>;
 }
@@ -50,6 +52,7 @@ export function createNodeFileSystem(): IFileSystem {
     rm: (filePath, options) => fsPromises.rm(filePath, options),
     rmRecursive: (target) => fsPromises.rm(target, { force: true, recursive: true }),
     rename: (from, to) => fsPromises.rename(from, to),
+    chmod: (filePath, mode) => fsPromises.chmod(filePath, mode),
     exists: async (filePath) => {
       try {
         await fsPromises.access(filePath);

@@ -64,6 +64,11 @@ function makeFakeFs(seed?: Record<string, string>): IFileSystem & {
       return Promise.resolve();
     },
     exists: (p) => Promise.resolve(files.has(p)),
+    chmod: (p, mode) => {
+      operations.push(`chmod ${p} ${mode.toString(8)}`);
+      modes.set(p, mode);
+      return Promise.resolve();
+    },
     dump: () => Object.fromEntries(files),
     modes,
     operations,
@@ -212,6 +217,27 @@ describe('AndroidTvCertStore — Google TV non-regression gate', () => {
       expect(result).toEqual({ cert: CLIENT_CERT, key: CLIENT_KEY });
       expect(generator).not.toHaveBeenCalled();
       expect(logger.info.mock.calls).toHaveLength(0);
+    });
+
+    it('restricts an existing world-readable private key to the owner when loading it', async () => {
+      useFs(seedPair(DEVICE_ID));
+      expect(fs.modes.get(files(DEVICE_ID).key)).toBeUndefined();
+      await store.loadOrCreate(DEVICE_ID);
+      expect(fs.modes.get(files(DEVICE_ID).key)).toBe(0o600);
+    });
+
+    it('restricts a key adopted from a legacy name', async () => {
+      useFs(seedPair(MAC));
+      await store.loadOrCreate(DEVICE_ID, [MAC]);
+      expect(fs.modes.get(files(DEVICE_ID).key)).toBe(0o600);
+    });
+
+    it('still loads the pair when permissions cannot be changed', async () => {
+      useFs(seedPair(DEVICE_ID));
+      vi.spyOn(fs, 'chmod').mockRejectedValueOnce(new Error('EPERM'));
+      await expect(store.loadOrCreate(DEVICE_ID)).resolves.toEqual(GENERATED);
+      expect(logger.warn).toHaveBeenCalled();
+      expect(generator).not.toHaveBeenCalled();
     });
 
     it('regenerates if cert exists but key is missing (partial state)', async () => {
