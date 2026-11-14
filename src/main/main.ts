@@ -18,7 +18,7 @@ import {
 import { showOnboardingOnce } from '../backend/app/onboarding';
 import { createNodeFileSystem } from '../backend/core/fileSystem';
 import { PreferencesController } from '../backend/preferences';
-import { INVOKE_CHANNELS } from '../shared/ipcContract';
+import { EVENT_CHANNELS, INVOKE_CHANNELS } from '../shared/ipcContract';
 import type { UpdaterStatus } from '../shared/types';
 import { WINDOW_LAYOUTS, type WindowLayout } from '../shared/windowLayout';
 
@@ -43,6 +43,7 @@ import {
   requireTextInput,
   requireVoiceChunk,
   requireVoiceSessionId,
+  requireAudioOutputLink,
   requireWindowLayout,
 } from './ipcValidation';
 import { getLoggerPath, logError, logInfo } from './logger';
@@ -289,7 +290,11 @@ async function createWindow(): Promise<BrowserWindow> {
     if (window.isDestroyed() || window.webContents.isDestroyed()) {
       return;
     }
-    window.webContents.send('updater:statusChanged', status);
+    window.webContents.send(EVENT_CHANNELS.updaterStatusChanged, status);
+  });
+  const unsubscribeAudioVolume = adapter.onAudioVolume((volume) => {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) return;
+    window.webContents.send(EVENT_CHANNELS.audioVolumeChanged, volume);
   });
 
   // Lifecycle handlers are attached before loading so a failed or slow load
@@ -305,6 +310,7 @@ async function createWindow(): Promise<BrowserWindow> {
   window.on('closed', () => {
     void preferences.setShortcutCapture(false);
     unsubscribeUpdater();
+    unsubscribeAudioVolume();
     if (windowRef === window) {
       windowRef = undefined;
     }
@@ -817,6 +823,16 @@ function registerIpc() {
   handle(
     ch.updaterRollback,
     captureIpc(ch.updaterRollback, async () => rollbackToPreviousVersion())
+  );
+  handle(
+    ch.audioDiscover,
+    captureIpc(ch.audioDiscover, async () => adapter.discoverAudioOutputs())
+  );
+  handle(
+    ch.deviceSetAudioOutput,
+    captureIpc(ch.deviceSetAudioOutput, async (_event: unknown, deviceId: unknown, link: unknown) =>
+      adapter.setAudioOutput(requireDeviceId(deviceId), requireAudioOutputLink(link))
+    )
   );
   handle(ch.windowSetLayout, (_event, layout) => {
     applyWindowLayout(requireWindowLayout(layout));

@@ -7,6 +7,8 @@ import type {
 } from '../shared/ipcContract';
 import type { AppPreferences, PreferenceChange, PreferenceResult } from '../shared/preferences';
 import type {
+  AudioOutputLink,
+  AudioVolumeEvent,
   BootstrapState,
   CommandDispatchRequest,
   CommandDropReport,
@@ -14,6 +16,7 @@ import type {
   DeviceCapabilities,
   DeviceDraft,
   DeviceState,
+  DiscoveredAudioOutput,
   DiscoveredDevice,
   PairingRequest,
   SavedDevice,
@@ -52,10 +55,13 @@ const INVOKE_CHANNELS: typeof ContractInvokeChannels = {
   updaterInstall: 'updater:install',
   updaterRollback: 'updater:rollback',
   windowSetLayout: 'window:setLayout',
+  audioDiscover: 'audio:discover',
+  deviceSetAudioOutput: 'device:setAudioOutput',
 };
 
 const EVENT_CHANNELS: typeof ContractEventChannels = {
   updaterStatusChanged: 'updater:statusChanged',
+  audioVolumeChanged: 'audio:volumeChanged',
 };
 
 const api = {
@@ -105,6 +111,10 @@ const api = {
     ipcRenderer.invoke(INVOKE_CHANNELS.updaterRollback),
   setWindowLayout: (layout: WindowLayout): Promise<void> =>
     ipcRenderer.invoke(INVOKE_CHANNELS.windowSetLayout, layout),
+  discoverAudioOutputs: (): Promise<DiscoveredAudioOutput[]> =>
+    ipcRenderer.invoke(INVOKE_CHANNELS.audioDiscover),
+  setAudioOutput: (deviceId: string, link: AudioOutputLink | null): Promise<SavedDevice[]> =>
+    ipcRenderer.invoke(INVOKE_CHANNELS.deviceSetAudioOutput, deviceId, link),
   /**
    * Subscribe to push-style updater status updates. The main process emits
    * `EVENT_CHANNELS.updaterStatusChanged` whenever the underlying state
@@ -119,6 +129,15 @@ const api = {
     ipcRenderer.on(EVENT_CHANNELS.updaterStatusChanged, wrapped);
     return () => {
       ipcRenderer.off(EVENT_CHANNELS.updaterStatusChanged, wrapped);
+    };
+  },
+  onAudioVolume: (listener: (event: AudioVolumeEvent) => void): (() => void) => {
+    const wrapped = (_event: unknown, volume: AudioVolumeEvent) => {
+      listener(volume);
+    };
+    ipcRenderer.on(EVENT_CHANNELS.audioVolumeChanged, wrapped);
+    return () => {
+      ipcRenderer.off(EVENT_CHANNELS.audioVolumeChanged, wrapped);
     };
   },
 };

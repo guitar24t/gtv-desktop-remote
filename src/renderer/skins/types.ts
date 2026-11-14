@@ -38,6 +38,8 @@ export interface RemoteSkinProps {
   /** Forget the current TV; undefined when there is none to forget. */
   onForget: (() => void) | undefined;
   onSettings: () => void;
+  /** Name of the linked speaker that takes the volume keys, when the link is on. */
+  volumeTarget: string | undefined;
 }
 
 export interface RemoteSkin {

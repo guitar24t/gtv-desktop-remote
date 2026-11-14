@@ -169,6 +169,7 @@ export function normalizeDraft(
     networkHostName: normalizedNetworkHostName ?? existing?.networkHostName,
     deviceFingerprint: normalizedDeviceFingerprint ?? existing?.deviceFingerprint,
     lastConnectedAt: existing?.lastConnectedAt,
+    audioOutput: existing?.audioOutput,
   };
 }
 

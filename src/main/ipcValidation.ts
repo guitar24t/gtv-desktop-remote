@@ -1,6 +1,7 @@
 import { isIP } from 'node:net';
 
 import type {
+  AudioOutputLink,
   CommandDispatchRequest,
   CommandDropReason,
   CommandDropReport,
@@ -202,4 +203,28 @@ export function requireVoiceChunk(value: unknown): string {
 export function requireWindowLayout(value: unknown): WindowLayout {
   if (!isWindowLayout(value)) throw new Error('Invalid window layout.');
   return value;
+}
+
+const SONOS_PLAYER_ID = /^RINCON_[0-9A-F]{12,40}$/i;
+
+/** A speaker link from Settings, or `null` to unlink. */
+export function requireAudioOutputLink(value: unknown): AudioOutputLink | null {
+  if (value === null) return null;
+  if (!isRecord(value)) throw new Error('Invalid speaker link.');
+  if (typeof value.enabled !== 'boolean') throw new Error('Invalid speaker link.');
+  if (value.kind !== 'sonos') throw new Error('Unsupported speaker type.');
+  const id = boundedString(value.id, 'speaker ID', 64);
+  if (!SONOS_PLAYER_ID.test(id)) throw new Error('Invalid speaker ID.');
+  const step = value.volumeStep;
+  if (typeof step !== 'number' || !Number.isInteger(step) || step < 1 || step > 10) {
+    throw new Error('Invalid volume step.');
+  }
+  return {
+    enabled: value.enabled,
+    kind: 'sonos',
+    id,
+    name: boundedString(value.name, 'speaker name', 200),
+    host: value.host === undefined ? undefined : requireHost(value.host),
+    volumeStep: step,
+  };
 }

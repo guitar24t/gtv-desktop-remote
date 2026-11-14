@@ -2,12 +2,13 @@ import type * as NodeFs from 'node:fs';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { AudioOutputRouter } from '../../../../src/main/audio/audioOutputRouter';
 import {
   CertificateRejectedError,
   ServerIdentityMismatchError,
 } from '../../../../src/main/device/androidTvRemote.types';
 import { GoogleTvAdapter } from '../../../../src/main/device/googleTvAdapter';
-import type { DiscoveredDevice, SavedDevice } from '../../../../src/shared/types';
+import type { AudioOutputLink, DiscoveredDevice, SavedDevice } from '../../../../src/shared/types';
 
 const state = vi.hoisted(() => ({
   devices: [] as SavedDevice[],
@@ -387,5 +388,111 @@ describe('GoogleTvAdapter', () => {
     expect(state.bridge.reset).toHaveBeenCalledOnce();
     expect(state.devices).toEqual([]);
     await expect(adapter.sendCommand(command())).rejects.toThrow('No active device connected.');
+  });
+});
+
+describe('GoogleTvAdapter speaker links', () => {
+  const link: AudioOutputLink = {
+    enabled: true,
+    kind: 'sonos',
+    id: 'RINCON_000000000A0101400',
+    name: 'Living Room',
+    host: '10.0.0.10',
+    volumeStep: 2,
+  };
+  let router: { handle: ReturnType<typeof vi.fn>; forget: ReturnType<typeof vi.fn> };
+  let adapter: GoogleTvAdapter;
+
+  const key = (
+    commandName: 'volume_up' | 'volume_down' | 'mute' | 'right',
+    id: string = commandName
+  ) => ({
+    id,
+    command: commandName,
+    issuedAt: 0,
+    source: 'button' as const,
+  });
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    state.devices = [device()];
+    for (const fn of Object.values(state.bridge)) fn.mockResolvedValue(undefined);
+    state.bridge.connect.mockResolvedValue({});
+    state.bridge.disconnect.mockReturnValue(undefined);
+    state.bridge.dropRemoteClients.mockReturnValue(undefined);
+    router = { handle: vi.fn().mockResolvedValue(undefined), forget: vi.fn() };
+    adapter = new GoogleTvAdapter(undefined, router as unknown as AudioOutputRouter);
+  });
+
+  it('sends volume and mute to the linked speaker and everything else to the TV', async () => {
+    state.devices = [device({ audioOutput: link })];
+    await connected(adapter);
+
+    await adapter.sendCommand(key('volume_up'));
+    await adapter.sendCommand(key('volume_down'));
+    await adapter.sendCommand(key('mute'));
+    await adapter.sendCommand(key('right'));
+
+    expect(router.handle.mock.calls).toEqual([
+      ['device-a', link, 'volume_up'],
+      ['device-a', link, 'volume_down'],
+      ['device-a', link, 'mute'],
+    ]);
+    expect(state.bridge.sendCommand).toHaveBeenCalledOnce();
+    expect(state.bridge.sendCommand.mock.calls[0]?.[1]).toMatchObject({ command: 'right' });
+  });
+
+  it('keeps volume on the TV while the link is switched off', async () => {
+    state.devices = [device({ audioOutput: { ...link, enabled: false } })];
+    await connected(adapter);
+    await adapter.sendCommand(key('volume_up'));
+    expect(router.handle).not.toHaveBeenCalled();
+    expect(state.bridge.sendCommand).toHaveBeenCalledOnce();
+  });
+
+  it('applies a link changed mid-session without reconnecting, and unlinks with null', async () => {
+    await connected(adapter);
+    const saved = await adapter.setAudioOutput('device-a', link);
+    expect(saved[0]?.audioOutput).toEqual(link);
+    expect(state.devices[0]?.audioOutput).toEqual(link);
+
+    await adapter.sendCommand(key('volume_up'));
+    expect(router.handle).toHaveBeenCalledWith('device-a', link, 'volume_up');
+    expect(state.bridge.connect).toHaveBeenCalledOnce();
+
+    const unlinked = await adapter.setAudioOutput('device-a', null);
+    expect(unlinked[0]).not.toHaveProperty('audioOutput');
+    await adapter.sendCommand(key('volume_up', 'again'));
+    expect(state.bridge.sendCommand).toHaveBeenCalledOnce();
+    expect(router.forget).toHaveBeenCalled();
+  });
+
+  it('keeps each TV’s link separate', async () => {
+    state.devices = [
+      device(),
+      device({ id: 'device-b', host: '192.0.2.11', macAddress: undefined }),
+    ];
+    await adapter.setAudioOutput('device-b', link);
+    expect(state.devices.find((item) => item.id === 'device-a')).not.toHaveProperty('audioOutput');
+    expect(state.devices.find((item) => item.id === 'device-b')?.audioOutput).toEqual(link);
+  });
+
+  it('rejects linking a TV that is not saved', async () => {
+    await expect(adapter.setAudioOutput('missing', link)).rejects.toThrow(
+      'Saved device not found.'
+    );
+  });
+
+  it('surfaces a speaker failure as the command error', async () => {
+    state.devices = [device({ audioOutput: link })];
+    await connected(adapter);
+    router.handle.mockRejectedValueOnce(new Error('Sonos “Living Room”: did not respond'));
+    await expect(adapter.sendCommand(key('volume_up'))).rejects.toThrow('did not respond');
+    expect(state.bridge.sendCommand).not.toHaveBeenCalled();
+  });
+
+  it('forgets cached speaker addresses after sleep or a network change', () => {
+    adapter.handleSystemResume();
+    expect(router.forget).toHaveBeenCalledWith();
   });
 });

@@ -224,6 +224,19 @@ describe('normalizeDraft', () => {
     expect(result.isPaired).toBe(false);
   });
 
+  it('keeps a TV’s speaker link when the TV is saved again', () => {
+    const audioOutput = {
+      enabled: true,
+      kind: 'sonos' as const,
+      id: 'RINCON_000000000A0101400',
+      name: 'Living Room',
+      volumeStep: 2,
+    };
+    const result = normalizeDraft(draft(), saved({ audioOutput }), () => 'NEW-id');
+    expect(result.audioOutput).toEqual(audioOutput);
+    expect(normalizeDraft(draft(), undefined, () => 'NEW-id').audioOutput).toBeUndefined();
+  });
+
   it('preserves the existing id, isPaired, and lastConnectedAt', () => {
     const existing = saved({ id: 'old-id', isPaired: true, lastConnectedAt: '2024-01-01' });
     const result = normalizeDraft(draft(), existing, () => 'NEW-id');

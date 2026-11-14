@@ -11,6 +11,7 @@ import {
   requireTextInput,
   requireVoiceChunk,
   requireVoiceSessionId,
+  requireAudioOutputLink,
   requireWindowLayout,
 } from '../../../src/main/ipcValidation';
 
@@ -124,5 +125,42 @@ describe('IPC payload validation', () => {
     expect(requireVoiceChunk('AA==')).toBe('AA==');
     expect(() => requireVoiceChunk('!!!')).toThrow();
     expect(() => requireVoiceChunk('AAA')).toThrow();
+  });
+});
+
+describe('speaker link validation', () => {
+  const link = {
+    enabled: true,
+    kind: 'sonos',
+    id: 'RINCON_542A1BA2933701400',
+    name: 'Living Room',
+    host: '10.0.236.188',
+    volumeStep: 2,
+  };
+
+  it('accepts a Sonos link or null, keeping only known fields', () => {
+    expect(requireAudioOutputLink(null)).toBeNull();
+    expect(requireAudioOutputLink({ ...link, extra: 'x' })).toEqual(link);
+    expect(requireAudioOutputLink({ ...link, host: undefined })).toEqual({
+      ...link,
+      host: undefined,
+    });
+  });
+
+  it('rejects malformed links', () => {
+    for (const bad of [
+      undefined,
+      'sonos',
+      { ...link, kind: 'bluetooth' },
+      { ...link, id: 'not-a-player' },
+      { ...link, enabled: 'yes' },
+      { ...link, volumeStep: 0 },
+      { ...link, volumeStep: 11 },
+      { ...link, volumeStep: 1.5 },
+      { ...link, host: 'not a host' },
+      { ...link, name: 'x'.repeat(201) },
+    ]) {
+      expect(() => requireAudioOutputLink(bad)).toThrow();
+    }
   });
 });

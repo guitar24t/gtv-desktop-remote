@@ -21,7 +21,7 @@
  * violation that ESLint will eventually forbid).
  */
 import type { ClientApi, InvokeChannelKey } from './ipcContract';
-import type { UpdaterStatus } from './types';
+import type { AudioVolumeEvent, UpdaterStatus } from './types';
 
 /**
  * Friendly renderer-facing method names mapped onto the contract keys. The
@@ -59,6 +59,8 @@ export interface InvokeMethodMap {
   installAvailableUpdate: 'updaterInstall';
   rollbackToPreviousVersion: 'updaterRollback';
   setWindowLayout: 'windowSetLayout';
+  discoverAudioOutputs: 'audioDiscover';
+  setAudioOutput: 'deviceSetAudioOutput';
 }
 
 // Compile-time check: the friendly map covers every contract key exactly once.
@@ -84,6 +86,8 @@ export interface DesktopEventApi {
    * callers MUST call it on unmount.
    */
   onUpdaterStatus(listener: (status: UpdaterStatus) => void): () => void;
+  /** Subscribe to linked-speaker volume changes. Returns an unsubscribe function. */
+  onAudioVolume(listener: (event: AudioVolumeEvent) => void): () => void;
 }
 
 /** The full `window.gtvRemote` surface. */

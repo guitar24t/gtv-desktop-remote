@@ -112,9 +112,25 @@ function runDnsSd(args: string[], timeoutMs: number): Promise<string> {
   });
 }
 
-async function browseServiceInstances(serviceType: string, timeoutMs = 2500): Promise<string[]> {
+export async function browseServiceInstances(
+  serviceType: string,
+  timeoutMs = 2500
+): Promise<string[]> {
   const output = await runDnsSd(['-B', serviceType, 'local.'], timeoutMs);
   return parseDnsSdBrowseOutput(output, serviceType);
+}
+
+/**
+ * Resolves one browsed instance to its SRV target and TXT record, without
+ * looking up the target's address (callers like Sonos carry an IP in TXT).
+ */
+export async function resolveServiceRecord(
+  instanceName: string,
+  serviceType: string,
+  timeoutMs = 2000
+): Promise<{ hostName: string; port: number; txt: Record<string, string> } | null> {
+  const output = await runDnsSd(['-L', instanceName, serviceType, 'local.'], timeoutMs);
+  return parseDnsSdResolveOutput(output);
 }
 
 async function resolveService(

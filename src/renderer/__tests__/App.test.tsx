@@ -2,6 +2,8 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type {
+  AudioOutputLink,
+  AudioVolumeEvent,
   BootstrapState,
   CommandDispatchRequest,
   DeviceState,
@@ -105,6 +107,36 @@ function createMain(initial: BootstrapState, discovered: DiscoveredDevice[] = [d
     stopAssistantVoice: vi.fn((_sessionId: number) => Promise.resolve()),
     hasPendingAssistantVoiceSession: vi.fn(() => Promise.resolve(false)),
     setWindowLayout: vi.fn((_layout: string) => Promise.resolve()),
+    discoverAudioOutputs: vi.fn(() =>
+      Promise.resolve([
+        {
+          kind: 'sonos' as const,
+          id: 'RINCON_000000000A0101400',
+          name: 'Living Room',
+          host: '10.0.0.10',
+        },
+        {
+          kind: 'sonos' as const,
+          id: 'RINCON_000000000B0101400',
+          name: 'Office',
+          host: '10.0.0.20',
+        },
+      ])
+    ),
+    setAudioOutput: vi.fn((deviceId: string, link: AudioOutputLink | null) => {
+      main.devices = main.devices.map((device) => {
+        if (device.id !== deviceId) return device;
+        if (link) return { ...device, audioOutput: link };
+        const { audioOutput: _removed, ...rest } = device;
+        return rest;
+      });
+      return Promise.resolve(snapshot().devices);
+    }),
+    audioVolumeListeners: [] as ((event: AudioVolumeEvent) => void)[],
+    onAudioVolume: vi.fn((listener: (event: AudioVolumeEvent) => void) => {
+      api.audioVolumeListeners.push(listener);
+      return () => undefined;
+    }),
   };
   vi.stubGlobal('gtvRemote', api);
   return { api, main };
@@ -641,5 +673,121 @@ describe('remote skins', () => {
       'fast_forward',
       'mute',
     ]);
+  });
+});
+
+describe('TV audio (speaker links)', () => {
+  const idle: DeviceState = { status: 'idle', message: 'Ready.' };
+  const living: AudioOutputLink = {
+    enabled: true,
+    kind: 'sonos',
+    id: 'RINCON_000000000A0101400',
+    name: 'Living Room',
+    host: '10.0.0.10',
+    volumeStep: 2,
+  };
+
+  async function openSettings() {
+    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await screen.findByRole('heading', { name: 'TV audio' });
+  }
+
+  it('links a paired TV’s volume keys to a Sonos room found on the network', async () => {
+    const { api } = createMain({ devices: [savedTv], deviceState: idle });
+    render(<App />);
+    await openSettings();
+    expect(await screen.findByText('2 Sonos rooms found.')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Volume keys for Living Room' }), {
+      target: { value: 'RINCON_000000000A0101400' },
+    });
+    await waitFor(() => {
+      expect(api.setAudioOutput).toHaveBeenCalledWith('tv-1', living);
+    });
+    expect(
+      await screen.findByRole('checkbox', { name: 'Use Living Room for volume' })
+    ).toBeChecked();
+  });
+
+  it('switches a link off without unlinking, changes its step, and unlinks back to the TV', async () => {
+    const { api } = createMain({
+      devices: [{ ...savedTv, audioOutput: living }],
+      deviceState: idle,
+    });
+    render(<App />);
+    await openSettings();
+    await screen.findByText('2 Sonos rooms found.');
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Use Living Room for volume' }));
+    await waitFor(() => {
+      expect(api.setAudioOutput).toHaveBeenLastCalledWith('tv-1', { ...living, enabled: false });
+    });
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Volume step for Living Room' }), {
+      target: { value: '5' },
+    });
+    await waitFor(() => {
+      expect(api.setAudioOutput).toHaveBeenLastCalledWith('tv-1', {
+        ...living,
+        enabled: false,
+        volumeStep: 5,
+      });
+    });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Volume keys for Living Room' }), {
+      target: { value: 'tv' },
+    });
+    await waitFor(() => {
+      expect(api.setAudioOutput).toHaveBeenLastCalledWith('tv-1', null);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('checkbox', { name: /for volume/ })).toBeNull();
+    });
+  });
+
+  it('keeps a linked speaker that is not found right now selectable', async () => {
+    const { api } = createMain({
+      devices: [
+        { ...savedTv, audioOutput: { ...living, id: 'RINCON_000000000C0101400', name: 'Den' } },
+      ],
+      deviceState: idle,
+    });
+    render(<App />);
+    await openSettings();
+    await waitFor(() => {
+      expect(api.discoverAudioOutputs).toHaveBeenCalled();
+    });
+    expect(
+      await screen.findByRole('option', { name: 'Den (not found right now)' })
+    ).toBeInTheDocument();
+  });
+
+  it('asks you to pair a TV first when none is paired', async () => {
+    const { api } = createMain({ devices: [], deviceState: idle });
+    render(<App />);
+    await openSettings();
+    expect(screen.getByText('Pair a TV to set up its audio.')).toBeInTheDocument();
+    expect(api.discoverAudioOutputs).not.toHaveBeenCalled();
+  });
+
+  it('shows the speaker’s volume on the remote and labels Classic’s volume keys', async () => {
+    const harness = createMain({
+      devices: [{ ...savedTv, audioOutput: living }],
+      deviceState: connected,
+    });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Select' })).toBeEnabled();
+    });
+    expect(screen.getByText('Sonos')).toBeInTheDocument();
+
+    act(() => {
+      for (const listener of harness.api.audioVolumeListeners)
+        listener({ deviceId: 'tv-1', outputName: 'Living Room', volume: 24 });
+    });
+    expect(await screen.findByText('Living Room · 24')).toBeInTheDocument();
+    act(() => {
+      for (const listener of harness.api.audioVolumeListeners)
+        listener({ deviceId: 'tv-1', outputName: 'Living Room', muted: true, volume: 24 });
+    });
+    expect(await screen.findByText('Living Room muted')).toBeInTheDocument();
   });
 });

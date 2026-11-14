@@ -19,6 +19,8 @@
  */
 import type { AppPreferences, PreferenceChange, PreferenceResult } from './preferences';
 import type {
+  AudioOutputLink,
+  AudioVolumeEvent,
   BootstrapState,
   CommandDispatchRequest,
   CommandDropReport,
@@ -26,6 +28,7 @@ import type {
   DeviceCapabilities,
   DeviceDraft,
   DeviceState,
+  DiscoveredAudioOutput,
   DiscoveredDevice,
   PairingRequest,
   SavedDevice,
@@ -67,6 +70,8 @@ export const INVOKE_CHANNELS = Object.freeze({
   updaterInstall: 'updater:install',
   updaterRollback: 'updater:rollback',
   windowSetLayout: 'window:setLayout',
+  audioDiscover: 'audio:discover',
+  deviceSetAudioOutput: 'device:setAudioOutput',
 } as const);
 
 export type InvokeChannelKey = keyof typeof INVOKE_CHANNELS;
@@ -105,6 +110,8 @@ export interface InvokeContract {
   updaterInstall: { args: []; res: UpdaterStatus };
   updaterRollback: { args: []; res: UpdaterStatus };
   windowSetLayout: { args: [WindowLayout]; res: undefined };
+  audioDiscover: { args: []; res: DiscoveredAudioOutput[] };
+  deviceSetAudioOutput: { args: [string, AudioOutputLink | null]; res: SavedDevice[] };
 }
 
 type _ContractParityCheck =
@@ -119,6 +126,7 @@ const _parity: _ContractParityCheck = true;
 
 export const EVENT_CHANNELS = Object.freeze({
   updaterStatusChanged: 'updater:statusChanged',
+  audioVolumeChanged: 'audio:volumeChanged',
 } as const);
 
 export type EventChannelKey = keyof typeof EVENT_CHANNELS;
@@ -126,6 +134,7 @@ export type EventChannelName = (typeof EVENT_CHANNELS)[EventChannelKey];
 
 export interface EventContract {
   updaterStatusChanged: UpdaterStatus;
+  audioVolumeChanged: AudioVolumeEvent;
 }
 
 type _EventParityCheck =

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 
 import { downsampleTo8kMono, toBase64 } from '../shared/audio';
 import type {
+  AudioVolumeEvent,
   BootstrapState,
   DeviceCapabilities,
   DeviceDraft,
@@ -66,6 +67,13 @@ function getDesktopApi() {
   return api;
 }
 
+function describeVolume(event: AudioVolumeEvent): string {
+  if (event.muted === true) return `${event.outputName} muted`;
+  return event.volume === undefined
+    ? event.outputName
+    : `${event.outputName} · ${String(event.volume)}`;
+}
+
 function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     if (typeof window === 'undefined') return 'dark';
@@ -92,6 +100,37 @@ function App() {
   useEffect(() => {
     saveSkinId(skinId);
   }, [skinId]);
+
+  // A linked speaker's volume has no on-screen display on the TV; show it here.
+  const [volumeToast, setVolumeToast] = useState<{
+    id: number;
+    text: string;
+    muted: boolean;
+  } | null>(null);
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    try {
+      unsubscribe = getDesktopApi().onAudioVolume((event) => {
+        setVolumeToast({
+          id: Date.now(),
+          text: describeVolume(event),
+          muted: event.muted === true,
+        });
+      });
+    } catch {
+      // Bridge unavailable; nothing to show.
+    }
+    return () => unsubscribe?.();
+  }, []);
+  useEffect(() => {
+    if (!volumeToast) return;
+    const timer = window.setTimeout(() => {
+      setVolumeToast((current) => (current?.id === volumeToast.id ? null : current));
+    }, 1600);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [volumeToast]);
   const settingsButtonRef = useRef<HTMLButtonElement>(null);
   const [bootstrap, setBootstrap] = useState<BootstrapState>({
     devices: [],
@@ -1451,6 +1490,9 @@ function App() {
     onSettings: () => {
       setSettingsOpen(true);
     },
+    volumeTarget: currentRemoteDevice?.audioOutput?.enabled
+      ? currentRemoteDevice.audioOutput.name
+      : undefined,
   };
   // A full-window skin replaces the app header and frame while its remote shows.
   const fullWindowRemote = currentView === 'remote' && !settingsOpen && skin.fullWindow;
@@ -1462,6 +1504,11 @@ function App() {
           <Preferences
             skinId={skinId}
             onSkinChange={setSkinId}
+            devices={bootstrap.devices.filter((device) => device.isPaired)}
+            onSetAudioOutput={async (deviceId, link) => {
+              const devices = await getDesktopApi().setAudioOutput(deviceId, link);
+              setBootstrap((current) => ({ ...current, devices }));
+            }}
             onClose={closeSettings}
             onResetAppState={async () => {
               if (await handleResetState()) {
@@ -1758,6 +1805,12 @@ function App() {
             ) : null}
           </>
         )}
+        {volumeToast && currentView === 'remote' && !settingsOpen ? (
+          <div key={volumeToast.id} className="ui-volume-toast" role="status">
+            <Icon name={volumeToast.muted ? 'mute' : 'volumeUp'} className="h-4 w-4" />
+            <span>{volumeToast.text}</span>
+          </div>
+        ) : null}
       </section>
     </main>
   );

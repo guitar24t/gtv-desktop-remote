@@ -17,6 +17,7 @@ export function ClassicRemote({
   onDevices,
   onDisconnect,
   onForget,
+  volumeTarget,
 }: RemoteSkinProps) {
   return (
     <div className="ui-remote-screen">
@@ -170,7 +171,12 @@ export function ClassicRemote({
             </button>
             <div className="ui-media-caption">
               <Icon name="volumeUp" className="h-4 w-4 text-on-surface-variant" />
-              <span className="ui-media-caption-label">Vol</span>
+              <span
+                className="ui-media-caption-label"
+                title={volumeTarget ? `Volume keys control ${volumeTarget}` : undefined}
+              >
+                {volumeTarget ? 'Sonos' : 'Vol'}
+              </span>
             </div>
             <button
               className="ui-media-button ui-media-button-block"

@@ -1,19 +1,26 @@
 import { useEffect, useRef, useState } from 'react';
 
 import type { AppPreferences, PreferenceChange } from '../shared/preferences';
+import type { AudioOutputLink, SavedDevice } from '../shared/types';
 
 import { getDesktopApi } from './api';
 import { shortcutLabel } from './lib/shortcut';
 import { ShortcutRecorder } from './ShortcutRecorder';
 import { REMOTE_SKINS, type RemoteSkinId } from './skins';
+import { TvAudioSettings } from './TvAudioSettings';
 
 export function Preferences({
   skinId,
   onSkinChange,
+  devices,
+  onSetAudioOutput,
   onClose,
   onResetAppState,
 }: {
   skinId: RemoteSkinId;
+  /** Paired TVs, for per-TV speaker links. */
+  devices: SavedDevice[];
+  onSetAudioOutput: (deviceId: string, link: AudioOutputLink | null) => Promise<void>;
   /** Applies immediately; the choice is remembered across launches. */
   onSkinChange: (skin: RemoteSkinId) => void;
   onClose: () => void;
@@ -136,6 +143,11 @@ export function Preferences({
             ))}
           </div>
         </section>
+        <TvAudioSettings
+          devices={devices}
+          disabled={recording}
+          onSetAudioOutput={onSetAudioOutput}
+        />
         {preferences ? (
           <>
             <section className="ui-settings-group" aria-labelledby="login-heading">

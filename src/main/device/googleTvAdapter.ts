@@ -19,16 +19,27 @@ import {
   type VoiceSessionTarget,
 } from '../../backend/voice/VoiceSessionService';
 import type {
+  AudioOutputLink,
+  AudioVolumeEvent,
   BootstrapState,
   CommandDispatchRequest,
   DeviceAdapter,
   DeviceCapabilities,
   DeviceDraft,
   DeviceState,
+  DiscoveredAudioOutput,
   DiscoveredDevice,
   PairingRequest,
   SavedDevice,
 } from '../../shared/types';
+import { AudioOutputRouter, isAudioCommand } from '../audio/audioOutputRouter';
+import { createSonosClient, type SonosClient } from '../audio/sonosClient';
+import {
+  candidatesFromMdns,
+  candidatesFromSsdp,
+  discoverSonosRooms,
+} from '../audio/sonosDiscovery';
+import { ssdpSearch } from '../audio/ssdpSearch';
 import { assertLoopbackHost, integrationEnvironment } from '../integrationEnvironment';
 import { createNodeLogger, getAppDataPath, logError, logInfo } from '../logger';
 import { commandMetricsStore } from '../metrics';
@@ -39,7 +50,7 @@ import {
   ServerIdentityMismatchError,
   type DeviceTarget,
 } from './androidTvRemote.types';
-import { discoverGoogleTvDevices } from './discovery';
+import { browseServiceInstances, discoverGoogleTvDevices, resolveServiceRecord } from './discovery';
 import { clearDeviceStore, readDevices, writeDevices } from './store';
 
 const DEFAULT_STATE: DeviceState = {
@@ -52,6 +63,22 @@ function getLegacyUserDataPaths(): string[] {
     return [getAppDataPath(), getAppDataPath('legacy', 'GTV Desktop Remote')];
   const appDataRoot = app.getPath('appData');
   return [getAppDataPath(), path.join(appDataRoot, 'GTV Desktop Remote')];
+}
+
+const SONOS_SEARCH_TARGET_SERVICE = '_sonos._tcp';
+
+/** Real-network Sonos discovery; disabled in the integration environment. */
+function discoverSonosOnNetwork(client: SonosClient) {
+  if (integrationEnvironment) return Promise.resolve([]);
+  return discoverSonosRooms({
+    browseMdns: async () =>
+      candidatesFromMdns(
+        await browseServiceInstances(SONOS_SEARCH_TARGET_SERVICE, 2500),
+        (instance) => resolveServiceRecord(instance, SONOS_SEARCH_TARGET_SERVICE)
+      ),
+    searchSsdp: async () => candidatesFromSsdp(await ssdpSearch()),
+    getRooms: (address) => client.getRooms(address),
+  });
 }
 
 function targetFor(device: SavedDevice, savedDevices: readonly SavedDevice[]): DeviceTarget {
@@ -81,7 +108,29 @@ export class GoogleTvAdapter implements DeviceAdapter {
 
   private readonly voiceSessions: VoiceSessionService;
 
-  constructor(voiceSessions?: VoiceSessionService) {
+  private readonly audioRouter: AudioOutputRouter;
+
+  private readonly sonosClient: SonosClient;
+
+  private readonly audioVolumeListeners = new Set<(event: AudioVolumeEvent) => void>();
+
+  constructor(voiceSessions?: VoiceSessionService, audioRouter?: AudioOutputRouter) {
+    this.sonosClient = createSonosClient({
+      assertHost: integrationEnvironment ? assertLoopbackHost : undefined,
+    });
+    this.audioRouter =
+      audioRouter ??
+      new AudioOutputRouter({
+        client: this.sonosClient,
+        discoverRooms: () => discoverSonosOnNetwork(this.sonosClient),
+        onHostChanged: async (deviceId, host) => {
+          await this.updateAudioOutput(deviceId, (link) => ({ ...link, host }));
+        },
+        emitVolume: (event) => {
+          for (const listener of this.audioVolumeListeners) listener(event);
+        },
+        logger: createNodeLogger(),
+      });
     this.voiceSessions =
       voiceSessions ??
       new VoiceSessionService(
@@ -483,6 +532,8 @@ export class GoogleTvAdapter implements DeviceAdapter {
    * join that reconnect.
    */
   handleSystemResume(): void {
+    // Speakers may have new addresses after sleep or a network change.
+    this.audioRouter.forget();
     const device = this.activeDevice;
     void logInfo('adapter', 'System resumed; dropping remote connections', {
       activeDeviceId: device?.id,
@@ -512,6 +563,22 @@ export class GoogleTvAdapter implements DeviceAdapter {
       throw new Error(errorMessage);
     }
 
+    const link = device.audioOutput;
+    if (link?.enabled && isAudioCommand(request.command)) {
+      // This TV's volume keys belong to a linked speaker, not the TV.
+      try {
+        await this.audioRouter.handle(device.id, link, request.command);
+      } catch (error) {
+        commandMetricsStore.recordCommandFailed(request, {
+          reason: 'send_failed',
+          errorMessage: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+      commandMetricsStore.recordAdapterDispatchCompleted(request.id);
+      return;
+    }
+
     try {
       await androidTvRemoteBridge.sendCommand(this.activeTarget(device), request);
     } catch (error) {
@@ -519,6 +586,48 @@ export class GoogleTvAdapter implements DeviceAdapter {
       throw error;
     }
     commandMetricsStore.recordAdapterDispatchCompleted(request.id);
+  }
+
+  /** Subscribe to linked-speaker volume changes. Returns an unsubscribe function. */
+  onAudioVolume(listener: (event: AudioVolumeEvent) => void): () => void {
+    this.audioVolumeListeners.add(listener);
+    return () => {
+      this.audioVolumeListeners.delete(listener);
+    };
+  }
+
+  async discoverAudioOutputs(): Promise<DiscoveredAudioOutput[]> {
+    const rooms = await discoverSonosOnNetwork(this.sonosClient);
+    return rooms.map(({ kind, id, name, host, model }) => ({ kind, id, name, host, model }));
+  }
+
+  /** Link (or unlink with `null`) a speaker to one TV's volume keys. */
+  async setAudioOutput(deviceId: string, link: AudioOutputLink | null): Promise<SavedDevice[]> {
+    const updated = await this.updateSavedDevice(deviceId, (device) => {
+      if (link) return { ...device, audioOutput: link };
+      const { audioOutput: _removed, ...rest } = device;
+      return rest;
+    });
+    if (!updated) {
+      throw new Error('Saved device not found.');
+    }
+    if (this.activeDevice?.id === deviceId) this.activeDevice = updated;
+    this.audioRouter.forget(link?.id);
+    await logInfo('adapter', 'Audio output link changed', {
+      deviceId,
+      linked: link ? { id: link.id, name: link.name, enabled: link.enabled } : null,
+    });
+    return readDevices();
+  }
+
+  private async updateAudioOutput(
+    deviceId: string,
+    update: (link: AudioOutputLink) => AudioOutputLink
+  ): Promise<void> {
+    const updated = await this.updateSavedDevice(deviceId, (device) =>
+      device.audioOutput ? { ...device, audioOutput: update(device.audioOutput) } : device
+    );
+    if (updated && this.activeDevice?.id === deviceId) this.activeDevice = updated;
   }
 
   async sendText(text: string): Promise<void> {

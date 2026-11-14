@@ -104,6 +104,12 @@ Click the sun in the device-list or remote header to switch to light theme, or t
 
 **Remote style** in Settings switches between skins. **Classic** is the original layout. **SHIELD** draws a slim black remote laid out like the 2019 NVIDIA SHIELD TV remote: Power and Settings on top, the navigation ring with Select, Back and Home, fast-forward, play/pause and rewind on the left, voice and volume on the right, and an oval Mute key (the real remote's Netflix key). While the SHIELD remote is showing, the window takes the shape of the remote; drag its body to move it. Its bottom dock opens the device list, text input, and a menu with Settings, Disconnect and Forget. Your choice is remembered across launches.
 
+### TV audio: control a Sonos speaker with the volume keys
+
+If a TV's sound plays through a Sonos speaker that its own remote controls by infrared, the TV's volume keys can't reach it. Open **Settings → TV audio**, and for each paired TV pick the Sonos room its sound comes out of under **Volume keys**. While the link is on, the volume and mute keys (and `+`/`-`/`M` on the keyboard) adjust that room instead of the TV, and the remote briefly shows the speaker's volume. Turn the link off with its checkbox without losing the choice, or pick **TV (default)** to unlink. Each TV keeps its own link, and **Step** sets how far one press moves the volume.
+
+Rooms are found with mDNS (`_sonos._tcp`, relayed across most routed networks) and SSDP. A home-theater set is one room: its soundbar is controlled and its sub and surrounds follow. Grouped music rooms are not changed. If a speaker gets a new address, the app finds it again automatically. The Mac must be able to reach the speakers on TCP port 1400.
+
 ### Finding, hiding, and quitting the remote
 
 On first launch, a dismissible **Welcome to GTV Remote** hint explains where the app lives. Click **Got it** to acknowledge it; it will not appear again on later launches.
@@ -149,6 +155,11 @@ Click or focus the show/hide shortcut control, then press and release the actual
 ---
 
 ## Troubleshooting
+
+**Sonos room missing under TV audio?**
+
+- Click **Search again**. Make sure the speaker is on and this Mac can reach it (Sonos uses TCP port 1400; firewalls must allow mDNS on UDP 5353).
+- A home-theater sub or surround is part of its room and is not listed separately.
 
 **TV not appearing in the scan?**
 

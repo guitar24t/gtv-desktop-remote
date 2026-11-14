@@ -117,6 +117,43 @@ export interface CommandMetricsSnapshot {
   recentCommands: CommandMetricsRecord[];
 }
 
+export type AudioOutputKind = 'sonos';
+
+/**
+ * A speaker that takes over this TV's volume and mute keys, for setups where
+ * the TV's own volume does not reach the speaker (e.g. a soundbar controlled
+ * by infrared). Stored per TV, and can be switched off without unlinking.
+ */
+export interface AudioOutputLink {
+  enabled: boolean;
+  kind: AudioOutputKind;
+  /** Sonos room's player UUID (`RINCON_…`). */
+  id: string;
+  /** Room name when it was linked, for display. */
+  name: string;
+  /** Last known address; refreshed automatically when the speaker moves. */
+  host?: string;
+  /** Volume change per key press, 1–10. */
+  volumeStep: number;
+}
+
+/** A speaker found on the network that a TV's volume keys can be linked to. */
+export interface DiscoveredAudioOutput {
+  kind: AudioOutputKind;
+  id: string;
+  name: string;
+  host: string;
+  model?: string;
+}
+
+/** Pushed after a linked speaker's volume or mute changes. */
+export interface AudioVolumeEvent {
+  deviceId: string;
+  outputName: string;
+  volume?: number;
+  muted?: boolean;
+}
+
 export interface SavedDevice {
   id: string;
   name: string;
@@ -129,6 +166,7 @@ export interface SavedDevice {
   networkHostName?: string;
   deviceFingerprint?: string;
   lastConnectedAt?: string;
+  audioOutput?: AudioOutputLink;
 }
 
 export interface DiscoveredDevice {
@@ -221,6 +259,8 @@ export interface DeviceAdapter {
   sendAssistantVoiceChunk(sessionId: number, chunkBase64: string): Promise<void>;
   stopAssistantVoice(sessionId: number): Promise<void>;
   hasPendingAssistantVoiceSession(): Promise<boolean>;
+  discoverAudioOutputs(): Promise<DiscoveredAudioOutput[]>;
+  setAudioOutput(deviceId: string, link: AudioOutputLink | null): Promise<SavedDevice[]>;
   getCapabilities(): Promise<DeviceCapabilities>;
   getBootstrapState(): Promise<BootstrapState>;
 }
