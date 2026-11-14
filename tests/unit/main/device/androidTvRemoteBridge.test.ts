@@ -7,6 +7,7 @@ import {
   CertificateRejectedError,
   ServerIdentityMismatchError,
   STALE_CONNECTION_MS,
+  STALE_UNKNOWN_CADENCE_MS,
 } from '../../../../src/main/device/androidTvRemote.types';
 import type { CommandDispatchRequest } from '../../../../src/shared/types';
 
@@ -305,8 +306,11 @@ describe('AndroidTvRemoteBridge', () => {
       await bridge.connect(A);
       const first = lastClient();
       first.emit('message', { type: 'ping', sequence: 1 });
+      now.mockReturnValue(1_005_000);
+      first.emit('message', { type: 'ping', sequence: 2 });
 
-      now.mockReturnValue(1_000_000 + STALE_CONNECTION_MS + 1);
+      // A TV that pings every 5s and then goes quiet for 15s+ is half-open.
+      now.mockReturnValue(1_005_000 + STALE_CONNECTION_MS + 1);
       await bridge.sendCommand(A, command());
 
       expect(first.close).toHaveBeenCalled();
@@ -325,6 +329,38 @@ describe('AndroidTvRemoteBridge', () => {
       expect(lastClient().text).toHaveBeenCalledWith('hi');
     });
 
+    it("judges silence against a slow-pinging TV's own cadence (e.g. SHIELD)", async () => {
+      const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      await bridge.connect(A);
+      const first = lastClient();
+      first.emit('message', { type: 'ping', sequence: 1 });
+      now.mockReturnValue(1_020_000);
+      first.emit('message', { type: 'ping', sequence: 2 });
+
+      // 25s of silence is normal for a TV that pings every 20s.
+      now.mockReturnValue(1_045_000);
+      await bridge.sendCommand(A, command());
+      expect(clients()).toHaveLength(1);
+
+      // Three missed intervals (60s+) means the link is dead.
+      now.mockReturnValue(1_020_000 + 60_001);
+      await bridge.sendCommand(A, command('cmd-2'));
+      expect(first.close).toHaveBeenCalled();
+      expect(clients()).toHaveLength(2);
+    });
+
+    it('allows a longer silence until the ping cadence is known', async () => {
+      const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      await bridge.connect(A);
+      lastClient().emit('message', { type: 'ping', sequence: 1 });
+      now.mockReturnValue(1_000_000 + STALE_CONNECTION_MS + 5_000);
+      await bridge.sendCommand(A, command());
+      expect(clients()).toHaveLength(1);
+      now.mockReturnValue(1_000_000 + STALE_UNKNOWN_CADENCE_MS + 1);
+      await bridge.sendCommand(A, command('cmd-2'));
+      expect(clients()).toHaveLength(2);
+    });
+
     it('does not penalize a TV that never pings', async () => {
       const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
       await bridge.connect(A);
@@ -337,7 +373,9 @@ describe('AndroidTvRemoteBridge', () => {
       const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
       await bridge.connect(A);
       lastClient().emit('message', { type: 'ping', sequence: 1 });
-      now.mockReturnValue(1_000_000 + STALE_CONNECTION_MS + 1);
+      now.mockReturnValue(1_005_000);
+      lastClient().emit('message', { type: 'ping', sequence: 2 });
+      now.mockReturnValue(1_005_000 + STALE_CONNECTION_MS + 1);
       await expect(bridge.startAssistantVoice(A)).resolves.toBe(7);
       expect(clients()).toHaveLength(2);
     });

@@ -16,7 +16,7 @@ import {
   CertificateRejectedError,
   DEFAULT_PAIRING_PORT,
   SERVICE_NAME,
-  STALE_CONNECTION_MS,
+  staleAfterMs,
   ServerIdentityMismatchError,
   normalizeRemoteError,
   toError,
@@ -141,7 +141,11 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
 
   isStale(now = Date.now()): boolean {
     const lastPingAt = this.state.lastPingAt;
-    return this.isConnected && lastPingAt !== undefined && now - lastPingAt > STALE_CONNECTION_MS;
+    return (
+      this.isConnected &&
+      lastPingAt !== undefined &&
+      now - lastPingAt > staleAfterMs(this.state.pingIntervalMs)
+    );
   }
 
   async connect(commandId?: string): Promise<void> {
@@ -264,6 +268,7 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
     this.client = client;
     // Ping freshness is per connection.
     this.state.lastPingAt = undefined;
+    this.state.pingIntervalMs = undefined;
     client.on('message', (message) => {
       if (this.client !== client) {
         return;
@@ -287,6 +292,10 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
           this.state.isOn = message.started;
           break;
         case 'ping':
+          if (this.state.lastPingAt !== undefined) {
+            const gap = now - this.state.lastPingAt;
+            this.state.pingIntervalMs = Math.max(this.state.pingIntervalMs ?? 0, gap);
+          }
           this.state.lastPingAt = now;
           break;
         case 'voice':
@@ -516,6 +525,7 @@ export class AndroidTvRemoteBridge {
         deviceId: session.deviceId,
         host: session.host,
         lastPingAt: client.snapshot.lastPingAt,
+        pingIntervalMs: client.snapshot.pingIntervalMs,
       });
       client.disconnect();
       session.remoteClient = undefined;

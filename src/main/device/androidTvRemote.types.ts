@@ -53,6 +53,8 @@ export interface RemoteState {
   lastActivityAt: number;
   /** When the TV last pinged this connection; undefined until the first ping. */
   lastPingAt?: number;
+  /** Longest gap seen between two pings on this connection. */
+  pingIntervalMs?: number;
   voiceSessionId?: number;
 }
 
@@ -82,10 +84,26 @@ export interface DeviceSession {
 }
 
 /**
- * A connection that has seen TV pings but none for this long is treated as
- * half-open and is replaced before the next command. TVs ping every ~5s.
+ * Shortest silence after which a pinging connection is treated as half-open
+ * and replaced before the next command.
  */
 export const STALE_CONNECTION_MS = 15_000;
+
+/** Silence allowed before a TV's ping cadence is known (fewer than two pings). */
+export const STALE_UNKNOWN_CADENCE_MS = 45_000;
+
+/** Missing this many of the TV's own ping intervals means the link is dead. */
+export const STALE_PING_INTERVALS = 3;
+
+/**
+ * TVs ping at very different rates (some every few seconds, NVIDIA SHIELD far
+ * less often), so silence is judged against each connection's observed cadence.
+ */
+export function staleAfterMs(pingIntervalMs: number | undefined): number {
+  return pingIntervalMs === undefined
+    ? STALE_UNKNOWN_CADENCE_MS
+    : Math.max(STALE_CONNECTION_MS, STALE_PING_INTERVALS * pingIntervalMs);
+}
 
 /**
  * Android TV pairing port (default).
