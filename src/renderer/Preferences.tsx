@@ -6,7 +6,14 @@ import { getDesktopApi } from './api';
 import { shortcutLabel } from './lib/shortcut';
 import { ShortcutRecorder } from './ShortcutRecorder';
 
-export function Preferences({ onClose }: { onClose: () => void }) {
+export function Preferences({
+  onClose,
+  onResetAppState,
+}: {
+  onClose: () => void;
+  /** Confirms with the user, then resets; rejects with a displayable error. */
+  onResetAppState: () => Promise<void>;
+}) {
   const [preferences, setPreferences] = useState<AppPreferences | null>(null);
   const [shortcut, setShortcut] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -33,6 +40,19 @@ export function Preferences({ onClose }: { onClose: () => void }) {
       mounted = false;
     };
   }, []);
+
+  async function resetAppState() {
+    setBusy(true);
+    setError(null);
+    setSaved(false);
+    try {
+      await onResetAppState();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'The app could not be reset.');
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function change(value: PreferenceChange) {
     setBusy(true);
@@ -168,6 +188,26 @@ export function Preferences({ onClose }: { onClose: () => void }) {
                 </p>
               ) : null}
             </form>
+            <section className="ui-settings-group" aria-labelledby="reset-heading">
+              <h3 id="reset-heading" className="ui-settings-label">
+                Reset app state
+              </h3>
+              <p id="reset-description" className="ui-settings-copy">
+                Removes every saved device and pairing certificate from this Mac. You will need to
+                pair your TVs again.
+              </p>
+              <button
+                type="button"
+                className="ui-settings-button ui-settings-danger"
+                aria-describedby="reset-description"
+                disabled={busy || recording}
+                onClick={() => {
+                  void resetAppState();
+                }}
+              >
+                Reset App State
+              </button>
+            </section>
           </>
         ) : (
           <p className="ui-settings-copy">

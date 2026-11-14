@@ -1368,12 +1368,17 @@ function App() {
     }
   }
 
-  async function handleResetState() {
+  /**
+   * Asks for confirmation, then removes every saved device and pairing certificate.
+   * Resolves `true` once reset, `false` if cancelled; failures reject so Settings,
+   * where the action lives, can show them.
+   */
+  async function handleResetState(): Promise<boolean> {
     const confirmed = window.confirm(
       'Reset the app and remove all saved devices and pairing certificates?'
     );
     if (!confirmed) {
-      return;
+      return false;
     }
 
     beginDeviceAction();
@@ -1392,14 +1397,7 @@ function App() {
       setTextInput('');
       setTextInputOpen(false);
       setDevicePickerOpen(true);
-    } catch (error) {
-      setBootstrap((current) => ({
-        ...current,
-        deviceState: {
-          status: 'error',
-          message: (error as Error).message,
-        },
-      }));
+      return true;
     } finally {
       setBusy(false);
     }
@@ -1431,6 +1429,13 @@ function App() {
         message: (error as Error).message,
       }));
     }
+  }
+
+  function closeSettings() {
+    setSettingsOpen(false);
+    window.requestAnimationFrame(() => {
+      settingsButtonRef.current?.focus();
+    });
   }
 
   function openDevicePicker() {
@@ -1613,11 +1618,12 @@ function App() {
       <section className="ui-frame">
         {settingsOpen ? (
           <Preferences
-            onClose={() => {
-              setSettingsOpen(false);
-              window.requestAnimationFrame(() => {
-                settingsButtonRef.current?.focus();
-              });
+            onClose={closeSettings}
+            onResetAppState={async () => {
+              if (await handleResetState()) {
+                // Return to the (now empty) device list so the result is visible.
+                closeSettings();
+              }
             }}
           />
         ) : (
@@ -1802,16 +1808,7 @@ function App() {
                         void appHandleScanDevices(false);
                       }}
                     >
-                      Don&apos;t see your device?
-                    </button>
-                    <button
-                      className="ui-help-chip ui-help-chip-danger"
-                      disabled={bridgeDisabled}
-                      onClick={() => {
-                        void handleResetState();
-                      }}
-                    >
-                      Reset App State
+                      Rescan devices
                     </button>
                   </div>
                 </div>

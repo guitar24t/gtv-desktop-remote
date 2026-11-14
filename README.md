@@ -138,6 +138,8 @@ Settings replaces the remote or device list while open. Click **Done** or press 
 
 Click the gear at the far right of the device, pairing, or remote header to open **Settings**. Enable or disable **Launch at login** in the installed macOS app; development Electron is never added to Login Items. It is off by default, and macOS **System Settings → General → Login Items** remains authoritative. Opening Settings refreshes the current macOS state, including external changes made while the app is running, without re-enabling a disabled item. If macOS readback fails, the toggle shows an unknown state and an error; reopen Settings to retry.
 
+**Reset App State**, at the bottom of Settings, removes every saved device and pairing certificate after you confirm, then returns to the empty device list; you will need to pair your TVs again.
+
 Click or focus the show/hide shortcut control, then press and release the actual keys and click **Save shortcut**. For example, hold Control and Option and press G on Mac to record **Ctrl+Opt+G** (**Ctrl+Alt+G** on Windows), then release the keys to finish recording. Meta is displayed as **Cmd** on Mac and **Win** on Windows. Use modifiers plus a letter, digit, or F1–F24; at least one modifier must be other than Shift. Modifier presses preview the combination; unsupported keys explain what is supported. After a supported chord is pressed, the control previews it and asks you to release the keys; recording finishes when you release that chord's letter, digit, or function key, or any of its modifiers (macOS does not report releasing a key pressed while Cmd is held, so releasing Cmd finishes a Cmd chord). **Escape** cancels recording without closing Settings; **Tab**, leaving the control, or closing the view also cancels, including while a captured key is still held. While recording, this app temporarily releases its global shortcut so recording that same chord cannot hide the window, then restores it after recording finishes or is cancelled. If another app takes the binding during recording, Settings reports that it could not be restored rather than claiming it is active; the menu bar remains usable. Recorded shortcuts are stored internally in Electron accelerator format, not display labels, and saved across restarts. A failed replacement keeps the previous working shortcut. If the saved shortcut is occupied on startup, Settings shows the problem; the menu bar still opens the remote.
 
 ---
@@ -148,7 +150,7 @@ Click or focus the show/hide shortcut control, then press and release the actual
 
 - Confirm the TV and Mac are on the same Wi-Fi network.
 - Confirm Android TV Remote Service is enabled on the TV.
-- Try re-running the network scan.
+- Click **Rescan devices** below the device list to run the network scan again. Only devices running Android TV Remote Service are listed; Cast-only devices such as Nest Hubs and Home speakers are not.
 
 **Pairing not completing?**
 

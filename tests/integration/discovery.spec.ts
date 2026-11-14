@@ -47,7 +47,7 @@ for (const service of ['_androidtvremote2._tcp', '_googlecast._tcp', 'adb'] as c
       expect(records[0].adbPort).toBe(5555);
       expect(records[0].pairingPort).toBe(h.tv.pairingPort);
     }
-    await h.page.getByRole('button', { name: "Don't see your device?", exact: true }).click();
+    await h.page.getByRole('button', { name: 'Rescan devices', exact: true }).click();
     await expect(h.page.getByRole('button').filter({ hasText: name })).toHaveCount(1);
   });
 }
@@ -65,7 +65,7 @@ test('DISCOVERY-NON-TV: Cast-only and ADB-only devices are not offered for pairi
     { name: 'Synthetic phone', service: '_adb-tls-connect._tcp', host: h.tv.host, port: 5555 },
   ]);
   expect(await h.api('scanDevices')).toEqual([]);
-  await h.page.getByRole('button', { name: "Don't see your device?", exact: true }).click();
+  await h.page.getByRole('button', { name: 'Rescan devices', exact: true }).click();
   await expect(h.page.getByText('No new devices detected right now.')).toBeVisible();
   await expect(h.page.getByRole('button').filter({ hasText: 'Kitchen Display' })).toHaveCount(0);
 });
@@ -82,10 +82,10 @@ for (const mode of ['empty', 'malformed', 'error'] as const) {
           ? { malformed: true }
           : {}
     );
-    await h.page.getByRole('button', { name: "Don't see your device?", exact: true }).click();
+    await h.page.getByRole('button', { name: 'Rescan devices', exact: true }).click();
     await expect(h.page.getByText('No new devices detected right now.')).toBeVisible();
     await h.tv.setDiscovery([{ name: 'Recovered TV', host: h.tv.host }]);
-    await h.page.getByRole('button', { name: "Don't see your device?", exact: true }).click();
+    await h.page.getByRole('button', { name: 'Rescan devices', exact: true }).click();
     await expect(h.page.getByRole('button').filter({ hasText: 'Recovered TV' })).toBeVisible();
   });
 }

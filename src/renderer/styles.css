@@ -303,6 +303,16 @@ p {
   align-self: flex-start;
 }
 
+.ui-settings-danger {
+  align-self: flex-start;
+  background: rgba(147, 0, 10, 0.2);
+  color: var(--danger-text);
+}
+
+.ui-settings-danger:hover:not(:disabled) {
+  background: rgba(147, 0, 10, 0.3);
+}
+
 .ui-settings :focus-visible,
 .ui-icon-button:focus-visible {
   outline: 2px solid var(--primary);
@@ -682,15 +692,6 @@ p {
 
 .ui-help-chip:hover {
   background: rgba(187, 195, 255, 0.12);
-}
-
-.ui-help-chip-danger {
-  background: rgba(147, 0, 10, 0.2);
-  color: var(--danger-text);
-}
-
-.ui-help-chip-danger:hover {
-  background: rgba(147, 0, 10, 0.3);
 }
 
 .ui-update-check {
@@ -1313,11 +1314,11 @@ p {
   background: rgba(52, 74, 193, 0.12);
 }
 
-:root[data-theme='light'] .ui-help-chip-danger {
+:root[data-theme='light'] .ui-settings-danger {
   background: rgba(147, 0, 10, 0.08);
 }
 
-:root[data-theme='light'] .ui-help-chip-danger:hover,
+:root[data-theme='light'] .ui-settings-danger:hover:not(:disabled),
 :root[data-theme='light'] .ui-alert:not(.ui-alert-connecting) {
   background: rgba(147, 0, 10, 0.12);
 }

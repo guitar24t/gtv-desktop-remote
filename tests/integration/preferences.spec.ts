@@ -9,7 +9,8 @@ for (const cancel of ['Escape', 'Tab', 'blur'] as const) {
   }) => {
     const before = await h.api('getPreferences');
     await h.page.getByRole('button', { name: 'Settings', exact: true }).click();
-    await expect(h.page.getByRole('button', { name: 'Reset App State', exact: true })).toHaveCount(
+    // Settings replaces the device list rather than layering over it.
+    await expect(h.page.getByRole('button', { name: 'Rescan devices', exact: true })).toHaveCount(
       0
     );
     await h.focusNativeWindow();

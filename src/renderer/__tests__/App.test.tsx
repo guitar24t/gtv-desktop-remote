@@ -82,7 +82,21 @@ function createMain(initial: BootstrapState, discovered: DiscoveredDevice[] = [d
       }
       return Promise.resolve(snapshot().devices);
     }),
-    resetState: vi.fn(() => Promise.resolve({ status: 'idle', message: 'Reset.' })),
+    resetState: vi.fn(() => {
+      main.devices = [];
+      main.deviceState = { status: 'idle', message: 'App state reset. Pair your devices again.' };
+      return Promise.resolve(snapshot().deviceState);
+    }),
+    getPreferences: vi.fn(() =>
+      Promise.resolve({
+        shortcut: 'CommandOrControl+Shift+G',
+        activeShortcut: 'CommandOrControl+Shift+G',
+        shortcutError: null,
+        launchAtLogin: false,
+        launchAtLoginError: null,
+        launchAtLoginSupported: true,
+      })
+    ),
     sendCommand: vi.fn((_request: CommandDispatchRequest) => Promise.resolve()),
     recordCommandDrop: vi.fn(() => Promise.resolve()),
     sendText: vi.fn((_text: string) => Promise.resolve()),
@@ -420,7 +434,7 @@ describe('scanning', () => {
         })
     );
     render(<App />);
-    const rescan = await screen.findByRole('button', { name: "Don't see your device?" });
+    const rescan = await screen.findByRole('button', { name: 'Rescan devices' });
     await waitFor(() => {
       expect(api.scanDevices).toHaveBeenCalledTimes(1);
     });
@@ -455,5 +469,65 @@ describe('pairing code entry', () => {
 
     expect(input).toHaveValue('AB12CD');
     expect(screen.getByRole('button', { name: 'Connect' })).toBeEnabled();
+  });
+});
+
+describe('reset lives in Settings', () => {
+  const idle: DeviceState = { status: 'idle', message: 'Ready.' };
+
+  async function openSettings() {
+    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    return screen.findByRole('button', { name: 'Reset App State' });
+  }
+
+  it('offers Rescan devices on the device list and no reset button there', async () => {
+    const { api } = createMain({ devices: [savedTv], deviceState: idle });
+    render(<App />);
+    // Let startup (bootstrap, updater subscription, first scan) settle before asserting.
+    expect(await screen.findByText('Living Room')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(api.scanDevices).toHaveBeenCalled();
+    });
+    expect(await screen.findByRole('button', { name: 'Rescan devices' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: 'Reset App State' })).toBeNull();
+    expect(screen.queryByRole('button', { name: "Don't see your device?" })).toBeNull();
+  });
+
+  it('keeps everything when the confirmation is cancelled', async () => {
+    const { api } = createMain({ devices: [savedTv], deviceState: idle });
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(<App />);
+    fireEvent.click(await openSettings());
+    await waitFor(() => {
+      expect(confirm).toHaveBeenCalledTimes(1);
+    });
+    expect(api.resetState).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: 'Settings' })).toBeInTheDocument();
+  });
+
+  it('resets after confirmation and returns to the empty device list', async () => {
+    const { api } = createMain({ devices: [savedTv], deviceState: idle });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<App />);
+    expect(await screen.findByText('Living Room')).toBeInTheDocument();
+    fireEvent.click(await openSettings());
+    await waitFor(() => {
+      expect(api.resetState).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.findByRole('button', { name: 'Rescan devices' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Settings' })).toBeNull();
+    expect(screen.getByText('No paired devices yet.')).toBeInTheDocument();
+  });
+
+  it('shows a reset failure inside Settings', async () => {
+    const { api } = createMain({ devices: [savedTv], deviceState: idle });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    api.resetState.mockRejectedValueOnce(new Error('Could not remove certificates.'));
+    render(<App />);
+    const reset = await openSettings();
+    fireEvent.click(reset);
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not remove certificates.');
+    expect(screen.getByRole('heading', { name: 'Settings' })).toBeInTheDocument();
+    expect(reset).toBeEnabled();
   });
 });

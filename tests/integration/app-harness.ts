@@ -274,7 +274,7 @@ export class AppHarness {
     // Non-fatal errors keep the remote view open, so return to the device list first.
     const devices = this.page.getByRole('button', { name: 'Devices', exact: true });
     if (await devices.isVisible()) await devices.click();
-    await this.page.getByRole('button', { name: "Don't see your device?", exact: true }).click();
+    await this.page.getByRole('button', { name: 'Rescan devices', exact: true }).click();
     const saved = this.page.locator('.ui-card').filter({ hasText: 'Synthetic TV' });
     await expect(saved).toBeEnabled();
     await saved.click();

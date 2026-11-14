@@ -152,7 +152,8 @@ test('RESET: cancel preserves identity, confirm deletes saved and legacy credent
   expect(devices).toHaveLength(1);
   const certificate = await h.certificate();
   const reset = h.page.getByRole('button', { name: 'Reset App State', exact: true });
-  await h.page.getByRole('button', { name: 'Devices', exact: true }).click();
+  // Reset lives in Settings, reachable from the remote header.
+  await h.page.getByRole('button', { name: 'Settings', exact: true }).click();
   // Fixture only the OS confirmation decision; clicks, reset IPC and storage stay real.
   // CDP dismissal does not reliably restore Electron's native window focus.
   await h.page.evaluate(() => {
@@ -161,6 +162,9 @@ test('RESET: cancel preserves identity, confirm deletes saved and legacy credent
   await reset.click();
   expect((await h.api('bootstrap')).devices).toEqual(devices);
   expect(await h.certificate()).toBe(certificate);
+  // Cancelling leaves Settings open with the action still available.
+  await expect(h.page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+  await expect(reset).toBeEnabled();
   const legacy = path.join(h.profile, 'legacy', 'GTV Desktop Remote');
   await mkdir(path.join(legacy, 'androidtvremote'), { recursive: true });
   await writeFile(path.join(legacy, 'devices.json'), '[]');
@@ -169,9 +173,10 @@ test('RESET: cancel preserves identity, confirm deletes saved and legacy credent
     window.confirm = () => true;
   });
   await reset.click();
-  // Bootstrap storage empties before legacy cleanup; wait for the awaited renderer operation.
+  // Settings closes once the awaited reset (storage, then legacy cleanup) finishes,
+  // returning to the now-empty device list.
+  await expect(h.page.getByRole('button', { name: 'Rescan devices', exact: true })).toBeEnabled();
   await expect(h.page.locator('.ui-devices-content .ui-card')).toHaveCount(0);
-  await expect(reset).toBeEnabled();
   expect((await h.api('bootstrap')).devices).toEqual([]);
   const certificateFiles = await readdir(path.join(h.profile, 'androidtvremote')).catch(
     (error: NodeJS.ErrnoException) => {
