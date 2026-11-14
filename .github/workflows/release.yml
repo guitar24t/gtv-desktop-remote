@@ -184,6 +184,11 @@ jobs:
     # approval that was granted to build-macos within the same run, so you
     # only have to approve once per release.
     environment: production
+    # semantic-release pushes the version commit and tag and publishes the
+    # GitHub Release. Without a GitHub App configured it uses this job's
+    # built-in token, which needs write access to repository contents.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -210,8 +215,11 @@ jobs:
           name: macos-zip
           path: zip-artifacts
 
+      # Optional: with APP_CLIENT_ID/APP_PRIVATE_KEY configured (e.g. when main
+      # is protected and needs an App bypass), semantic-release uses an App token.
       - name: Mint source App token
         id: source-token
+        if: ${{ vars.APP_CLIENT_ID != '' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
           client-id: ${{ vars.APP_CLIENT_ID }}
@@ -222,7 +230,7 @@ jobs:
 
       - name: Verify semantic-release version policy
         env:
-          GITHUB_TOKEN: ${{ steps.source-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.source-token.outputs.token || github.token }}
           EXPECTED_VERSION: ${{ needs.build-macos.outputs.next-version }}
         run: |
           git fetch --tags --quiet
@@ -247,7 +255,7 @@ jobs:
 
       - name: Release
         env:
-          GITHUB_TOKEN: ${{ steps.source-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.source-token.outputs.token || github.token }}
         run: yarn semantic-release
 
       # ── Optional Homebrew tap ──────────────────────────────────────────────
@@ -299,7 +307,7 @@ jobs:
       - name: Update Homebrew tap
         if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' }}
         env:
-          GITHUB_TOKEN: ${{ steps.source-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.source-token.outputs.token || github.token }}
           RELEASE_VERSION: ${{ needs.build-macos.outputs.next-version }}
           SOURCE_REPOSITORY: ${{ github.repository }}
         run: |

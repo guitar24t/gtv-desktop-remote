@@ -312,8 +312,10 @@ In the repo on GitHub:
    whoever should be able to approve releases).
 3. Under **Deployment branches and tags**, choose "Selected branches and
    tags" and add `main` (so releases can only be approved from `main`).
-4. Move release-sensitive App credentials onto this environment instead of the
-   repository-wide secrets:
+4. Optional — GitHub App credentials. Without them the `release` job publishes
+   with its built-in token (`contents: write`), which works while `main` is not
+   protected. Add an App when `main` gets branch protection (the App can be
+   allowed to bypass it) or to update a Homebrew tap in another repository:
    - `APP_CLIENT_ID` → **Environment variables** of `production`.
    - `APP_PRIVATE_KEY` → **Environment secrets** of `production`.
 
@@ -321,8 +323,11 @@ In the repo on GitHub:
    for `${{ github.repository_owner }}`/this repository, so nothing in the
    workflow names a specific account.
 
-   This guarantees the secret is only injected after you click "Approve and
-   run", so an unauthorized or accidental dispatch cannot exfiltrate it.
+If you skip this section entirely, GitHub creates the `production` environment
+on the first run without an approval step; the actor allow-list still applies.
+
+This guarantees the secret is only injected after you click "Approve and
+run", so an unauthorized or accidental dispatch cannot exfiltrate it.
 
 After this setup, the flow for a release is:
 

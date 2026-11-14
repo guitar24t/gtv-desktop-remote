@@ -119,3 +119,14 @@ test('release workflow uses the fork allow-list, repository-owner token and opti
   // The tap comes from the HOMEBREW_TAP_REPOSITORY variable, not a hardcoded repository.
   assert.doesNotMatch(releaseWorkflow, /repositor(?:y|ies): [\w./-]*homebrew-tap/);
 });
+
+test('release job works without a GitHub App by falling back to the built-in token', () => {
+  const releaseJob = releaseWorkflow.slice(releaseWorkflow.indexOf('\n  release:\n'));
+  assert.match(releaseJob, /permissions:\n\s+contents: write/);
+  const mint = steps(releaseJob).find((block) => /- name: Mint source App token/.test(block));
+  assert.ok(mint);
+  assert.match(mint, /if: \$\{\{ vars\.APP_CLIENT_ID != '' \}\}/);
+  const tokenUses = releaseJob.match(/GITHUB_TOKEN: \$\{\{ steps\.source-token\.outputs\.token[^}]*\}\}/g) ?? [];
+  assert.ok(tokenUses.length >= 2);
+  for (const use of tokenUses) assert.match(use, /\|\| github\.token/);
+});
