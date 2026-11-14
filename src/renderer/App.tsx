@@ -1775,7 +1775,7 @@ function App() {
                                     className="h-[1.2rem] w-[1.2rem]"
                                   />
                                 </div>
-                                <div>
+                                <div className="ui-found-copy">
                                   <span className="block text-sm font-bold text-on-surface">
                                     {device.name}
                                   </span>
