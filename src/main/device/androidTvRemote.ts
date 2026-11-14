@@ -81,6 +81,11 @@ interface LibretvGoogleModule {
     rejectUnauthorized: boolean;
   }) => NodeTlsTransport;
   RemoteClient: new (options: { transport: NodeTlsTransport }) => LibretvRemoteClientInstance;
+  encodeRemoteMessage: (message: {
+    type: 'key';
+    keyCode: number;
+    action: 'down' | 'up' | 'press';
+  }) => Uint8Array;
 }
 
 /**
@@ -89,20 +94,29 @@ interface LibretvGoogleModule {
  */
 type ServerVerifier = (fingerprint256: string | undefined) => Promise<void>;
 
-const COMMAND_TO_LIBRETV_KEY: Record<CommandDispatchRequest['command'], string> = {
-  up: 'up',
-  down: 'down',
-  left: 'left',
-  right: 'right',
-  select: 'select',
-  home: 'home',
-  back: 'back',
-  play_pause: 'playPause',
-  volume_up: 'volumeUp',
-  volume_down: 'volumeDown',
-  power: 'power',
-  assistant_press: 'assistant',
-  assistant_release: 'assistant',
+/** A key the library names, or a raw Android `KeyEvent` code it has no name for. */
+type CommandKey = { name: string } | { keyCode: number };
+
+const COMMAND_KEYS: Record<CommandDispatchRequest['command'], CommandKey> = {
+  up: { name: 'up' },
+  down: { name: 'down' },
+  left: { name: 'left' },
+  right: { name: 'right' },
+  select: { name: 'select' },
+  home: { name: 'home' },
+  back: { name: 'back' },
+  play_pause: { name: 'playPause' },
+  volume_up: { name: 'volumeUp' },
+  volume_down: { name: 'volumeDown' },
+  power: { name: 'power' },
+  rewind: { keyCode: 89 }, // KEYCODE_MEDIA_REWIND
+  fast_forward: { keyCode: 90 }, // KEYCODE_MEDIA_FAST_FORWARD
+  mute: { keyCode: 164 }, // KEYCODE_VOLUME_MUTE
+  // KEYCODE_MENU: what the SHIELD remote's ≡ key sends. SHIELD opens Settings
+  // (or the user's custom action); KEYCODE_SETTINGS (176) is ignored there.
+  menu: { keyCode: 82 },
+  assistant_press: { name: 'assistant' },
+  assistant_release: { name: 'assistant' },
 };
 
 let librecontrolGoogleTvModule: Promise<LibretvGoogleModule> | undefined;
@@ -114,6 +128,8 @@ function loadLibretvGoogle(): Promise<LibretvGoogleModule> {
 
 class LibretvGoogleRemoteClient implements RemoteClientPort {
   private client: LibretvRemoteClientInstance | undefined;
+  /** The client's own TLS transport, used for raw key codes the client cannot name. */
+  private transport: NodeTlsTransport | undefined;
   private connectPromise: Promise<void> | undefined;
   private protocolReady = false;
   private connectionGeneration = 0;
@@ -175,6 +191,7 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
     const client = this.client;
     this.connectionGeneration += 1;
     this.client = undefined;
+    this.transport = undefined;
     this.connectPromise = undefined;
     this.protocolReady = false;
     this.clearVoiceSession();
@@ -186,13 +203,26 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
 
   async sendCommand(request: CommandDispatchRequest): Promise<void> {
     const client = this.requireClient();
-    const key = COMMAND_TO_LIBRETV_KEY[request.command];
-    if (request.command === 'assistant_press') {
-      await client.keyDown(key);
+    const key = COMMAND_KEYS[request.command];
+    if ('keyCode' in key) {
+      const transport = this.transport;
+      if (!transport) {
+        throw new Error('Connection has been lost.');
+      }
+      const { encodeRemoteMessage } = await loadLibretvGoogle();
+      if (this.client !== client || this.transport !== transport) {
+        throw new Error('Connection has been lost.');
+      }
+      // A single short press, as a physical remote sends it.
+      await transport.send(
+        encodeRemoteMessage({ type: 'key', keyCode: key.keyCode, action: 'press' })
+      );
+    } else if (request.command === 'assistant_press') {
+      await client.keyDown(key.name);
     } else if (request.command === 'assistant_release') {
-      await client.keyUp(key);
+      await client.keyUp(key.name);
     } else {
-      await client.commandDownUp(key);
+      await client.commandDownUp(key.name);
     }
     commandMetricsStore.recordSocketWrite(request, { host: this.host, buffered: false });
   }
@@ -266,6 +296,7 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
     });
     const client = new RemoteClient({ transport });
     this.client = client;
+    this.transport = transport;
     // Ping freshness is per connection.
     this.state.lastPingAt = undefined;
     this.state.pingIntervalMs = undefined;
@@ -316,6 +347,7 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
       commandMetricsStore.recordSocketClosed(this.host);
       this.protocolReady = false;
       this.client = undefined;
+      this.transport = undefined;
       this.connectPromise = undefined;
       this.connectionGeneration += 1;
       this.clearVoiceSession();
@@ -341,6 +373,7 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
     } catch (error) {
       if (this.client === client) {
         this.client = undefined;
+        this.transport = undefined;
         this.protocolReady = false;
         this.clearVoiceSession();
       }

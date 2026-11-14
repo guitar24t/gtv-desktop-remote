@@ -20,6 +20,7 @@ import { createNodeFileSystem } from '../backend/core/fileSystem';
 import { PreferencesController } from '../backend/preferences';
 import { INVOKE_CHANNELS } from '../shared/ipcContract';
 import type { UpdaterStatus } from '../shared/types';
+import { WINDOW_LAYOUTS, type WindowLayout } from '../shared/windowLayout';
 
 import { captureIpc, closeCapture, initCapture } from './capture';
 import { stopDiscovery } from './device/discovery';
@@ -42,6 +43,7 @@ import {
   requireTextInput,
   requireVoiceChunk,
   requireVoiceSessionId,
+  requireWindowLayout,
 } from './ipcValidation';
 import { getLoggerPath, logError, logInfo } from './logger';
 import { commandMetricsStore } from './metrics';
@@ -255,16 +257,18 @@ function attachWindowDiagnostics(window: BrowserWindow) {
 async function createWindow(): Promise<BrowserWindow> {
   const iconImage = applyApplicationIcon();
   const window = new BrowserWindow({
-    width: 360,
-    height: 720,
+    ...WINDOW_LAYOUTS.standard,
     useContentSize: true,
     show: false,
     resizable: false,
     title: appName,
     icon: iconImage,
-    backgroundColor: '#0b0b0b',
-    titleBarStyle: process.platform === 'darwin' ? 'hidden' : 'default',
-    trafficLightPosition: process.platform === 'darwin' ? { x: 16, y: 16 } : undefined,
+    // Frameless and transparent so a skin can give the window its own outline
+    // (rounded corners, or a remote-shaped body); the renderer paints everything.
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    hasShadow: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -276,9 +280,6 @@ async function createWindow(): Promise<BrowserWindow> {
   // Renderer bootstrap IPC can arrive while loadFile is still pending.
   windowRef = window;
 
-  if (process.platform === 'darwin') {
-    window.setWindowButtonVisibility(false);
-  }
   window.setSkipTaskbar(true);
 
   attachWindowDiagnostics(window);
@@ -333,6 +334,34 @@ function ensureWindow(): Promise<BrowserWindow> {
     windowCreation = undefined;
   });
   return windowCreation;
+}
+
+/**
+ * Resize the remote window for the current view/skin, keeping its top edge and
+ * horizontal center where they are so it does not jump around the screen.
+ */
+function applyWindowLayout(layout: WindowLayout) {
+  const window = windowRef;
+  if (!window || window.isDestroyed()) return;
+  const { width, height } = WINDOW_LAYOUTS[layout];
+  const current = window.getContentBounds();
+  if (current.width === width && current.height === height) return;
+  window.setContentBounds(
+    {
+      x: Math.round(current.x + (current.width - width) / 2),
+      y: current.y,
+      width,
+      height,
+    },
+    false
+  );
+  if (process.platform === 'darwin') {
+    // A transparent window's shadow follows its painted outline; recompute it
+    // once the renderer has drawn the new shape.
+    setTimeout(() => {
+      if (!window.isDestroyed()) window.invalidateShadow();
+    }, 150);
+  }
 }
 
 async function showWindow() {
@@ -789,6 +818,10 @@ function registerIpc() {
     ch.updaterRollback,
     captureIpc(ch.updaterRollback, async () => rollbackToPreviousVersion())
   );
+  handle(ch.windowSetLayout, (_event, layout) => {
+    applyWindowLayout(requireWindowLayout(layout));
+    return undefined;
+  });
 }
 
 if (hasSingleInstanceLock) {

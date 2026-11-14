@@ -37,12 +37,18 @@ const state = vi.hoisted(() => ({
   clearPin: vi.fn(),
   createPairingClient: vi.fn(),
   logError: vi.fn(),
+  /** Frames written straight to a transport (raw key codes), in order. */
+  rawFrames: [] as unknown[],
 }));
 
 vi.mock('@librecontrol/google-tv', async () => {
   const { EventEmitter: Emitter } = await import('node:events');
   class NodeTlsTransport {
     constructor(readonly options: { host: string }) {}
+    send = vi.fn((frame: unknown) => {
+      state.rawFrames.push(frame);
+      return Promise.resolve();
+    });
     getCertificates() {
       const fingerprint256 = state.fingerprints.get(this.options.host);
       return { peer: fingerprint256 ? { fingerprint256 } : undefined };
@@ -71,7 +77,9 @@ vi.mock('@librecontrol/google-tv', async () => {
       state.clients.push(this);
     }
   }
-  return { NodeTlsTransport, RemoteClient };
+  // Identity encoding keeps the raw key message inspectable in assertions.
+  const encodeRemoteMessage = (message: unknown) => message;
+  return { NodeTlsTransport, RemoteClient, encodeRemoteMessage };
 });
 vi.mock('../../../../src/backend/devices/credentials/androidTvCertStore', () => ({
   AndroidTvCertStore: class {
@@ -209,6 +217,35 @@ describe('AndroidTvRemoteBridge', () => {
       state.fingerprints.set('192.0.2.20', TV_FINGERPRINT);
       await bridge.sendCommand({ ...A, host: '192.0.2.20' }, command());
       expect(lastClient().host).toBe('192.0.2.20');
+    });
+  });
+
+  describe('media and settings keys', () => {
+    it.each([
+      ['rewind', 89],
+      ['fast_forward', 90],
+      ['mute', 164],
+      ['menu', 82],
+    ] as const)('sends %s as one raw Android key press (code %d)', async (name, keyCode) => {
+      state.fingerprints.set(A.host, TV_FINGERPRINT);
+      await bridge.connect(A);
+      state.rawFrames.length = 0;
+
+      await bridge.sendCommand(A, { ...command(), command: name });
+
+      expect(state.rawFrames).toEqual([{ type: 'key', keyCode, action: 'press' }]);
+      expect(lastClient().commandDownUp).not.toHaveBeenCalled();
+    });
+
+    it('keeps sending named keys through the client', async () => {
+      state.fingerprints.set(A.host, TV_FINGERPRINT);
+      await bridge.connect(A);
+      state.rawFrames.length = 0;
+
+      await bridge.sendCommand(A, { ...command(), command: 'play_pause' });
+
+      expect(lastClient().commandDownUp).toHaveBeenCalledWith('playPause');
+      expect(state.rawFrames).toEqual([]);
     });
   });
 

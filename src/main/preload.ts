@@ -19,6 +19,7 @@ import type {
   SavedDevice,
   UpdaterStatus,
 } from '../shared/types';
+import type { WindowLayout } from '../shared/windowLayout';
 
 // The window runs with `sandbox: true`, where a preload may only require Electron's
 // renderer modules. Channel names are therefore mirrored here instead of imported;
@@ -50,6 +51,7 @@ const INVOKE_CHANNELS: typeof ContractInvokeChannels = {
   updaterStatus: 'updater:status',
   updaterInstall: 'updater:install',
   updaterRollback: 'updater:rollback',
+  windowSetLayout: 'window:setLayout',
 };
 
 const EVENT_CHANNELS: typeof ContractEventChannels = {
@@ -101,6 +103,8 @@ const api = {
     ipcRenderer.invoke(INVOKE_CHANNELS.updaterInstall),
   rollbackToPreviousVersion: (): Promise<UpdaterStatus> =>
     ipcRenderer.invoke(INVOKE_CHANNELS.updaterRollback),
+  setWindowLayout: (layout: WindowLayout): Promise<void> =>
+    ipcRenderer.invoke(INVOKE_CHANNELS.windowSetLayout, layout),
   /**
    * Subscribe to push-style updater status updates. The main process emits
    * `EVENT_CHANNELS.updaterStatusChanged` whenever the underlying state

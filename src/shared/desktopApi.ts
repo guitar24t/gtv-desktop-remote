@@ -58,6 +58,7 @@ export interface InvokeMethodMap {
   getUpdaterStatus: 'updaterStatus';
   installAvailableUpdate: 'updaterInstall';
   rollbackToPreviousVersion: 'updaterRollback';
+  setWindowLayout: 'windowSetLayout';
 }
 
 // Compile-time check: the friendly map covers every contract key exactly once.

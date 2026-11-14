@@ -11,6 +11,7 @@ import {
   requireTextInput,
   requireVoiceChunk,
   requireVoiceSessionId,
+  requireWindowLayout,
 } from '../../../src/main/ipcValidation';
 
 describe('IPC payload validation', () => {
@@ -68,6 +69,21 @@ describe('IPC payload validation', () => {
       'Invalid pairing code'
     );
     expect(() => requirePairingRequest({ host: '10.0.0.5' })).toThrow();
+  });
+
+  it('accepts the media and TV settings keys', () => {
+    for (const command of ['rewind', 'fast_forward', 'mute', 'menu']) {
+      expect(
+        requireCommandRequest({ id: 'c', command, issuedAt: 1, source: 'button' }).command
+      ).toBe(command);
+    }
+  });
+
+  it('accepts only known window layouts', () => {
+    expect(requireWindowLayout('standard')).toBe('standard');
+    expect(requireWindowLayout('shield')).toBe('shield');
+    expect(() => requireWindowLayout('toString')).toThrow('Invalid window layout.');
+    expect(() => requireWindowLayout({ width: 9999 })).toThrow();
   });
 
   it('allows only known remote commands and sources', () => {

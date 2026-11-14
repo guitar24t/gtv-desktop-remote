@@ -102,6 +102,8 @@ The app remembers paired devices, so future connections are instant.
 
 Click the sun in the device-list or remote header to switch to light theme, or the moon to return to dark theme. Dark is the default; your choice is remembered across launches and also applies to Settings. The remote header uses a centered, subtly green **Connected** pill for an active connection and a neutral pill while connecting; the device-list header has no connection pill.
 
+**Remote style** in Settings switches between skins. **Classic** is the original layout. **SHIELD** draws a slim black remote laid out like the 2019 NVIDIA SHIELD TV remote: Power and Settings on top, the navigation ring with Select, Back and Home, fast-forward, play/pause and rewind on the left, voice and volume on the right, and an oval Mute key (the real remote's Netflix key). While the SHIELD remote is showing, the window takes the shape of the remote; drag its body to move it. Its bottom dock opens the device list, text input, and a menu with Settings, Disconnect and Forget. Your choice is remembered across launches.
+
 ### Finding, hiding, and quitting the remote
 
 On first launch, a dismissible **Welcome to GTV Remote** hint explains where the app lives. Click **Got it** to acknowledge it; it will not appear again on later launches.
@@ -117,16 +119,18 @@ On first launch, a dismissible **Welcome to GTV Remote** hint explains where the
 
 When the remote is focused and connected, your keyboard controls the TV directly:
 
-| Key                    | Action       |
-| ---------------------- | ------------ |
-| `↑` `↓` `←` `→`        | Navigate     |
-| `Enter`                | Select / OK  |
-| `Escape` / `Backspace` | Back         |
-| `H`                    | Home         |
-| `Space` / `K`          | Play / Pause |
-| `+` / `=`              | Volume Up    |
-| `-` / `_`              | Volume Down  |
-| `P`                    | Power        |
+| Key                    | Action                |
+| ---------------------- | --------------------- |
+| `↑` `↓` `←` `→`        | Navigate              |
+| `Enter`                | Select / OK           |
+| `Escape` / `Backspace` | Back                  |
+| `H`                    | Home                  |
+| `Space` / `K`          | Play / Pause          |
+| `+` / `=`              | Volume Up             |
+| `-` / `_`              | Volume Down           |
+| `P`                    | Power                 |
+| `[` / `]`              | Rewind / Fast-forward |
+| `M`                    | Mute                  |
 
 > `Cmd`, `Ctrl`, and `Option` combinations are ignored so they don't interfere with normal macOS shortcuts. Holding an arrow or volume key repeats it; holding any other key acts once.
 

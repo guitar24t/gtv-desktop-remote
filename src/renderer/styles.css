@@ -1392,13 +1392,503 @@ p {
 }
 
 @media (max-width: 420px) {
+  /* The app window is frameless and transparent: the frame paints the visible
+     window, with corners matching a native macOS window. */
+  :root,
+  :root[data-theme='light'] {
+    background: transparent;
+  }
+
   .ui-shell {
     padding: 0;
+    background: transparent;
   }
 
   .ui-frame {
     width: 100vw;
     height: 100vh;
-    border-radius: 0;
+    border-radius: 12px;
+  }
+}
+
+/* A full-window remote skin draws its own outline. */
+.ui-shell-bare {
+  background: transparent;
+}
+
+.ui-frame.ui-frame-bare {
+  background: transparent;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.ui-frame-bare::after {
+  display: none;
+}
+
+/* ---------- Settings: remote style ---------- */
+
+.ui-skin-options {
+  display: grid;
+  gap: 0.625rem;
+}
+
+.ui-skin-option {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid transparent;
+  border-radius: 1rem;
+  background: var(--surface-low);
+  cursor: pointer;
+}
+
+.ui-skin-option-selected {
+  border-color: var(--primary);
+  background: var(--surface-high);
+}
+
+.ui-skin-option input {
+  flex: 0 0 auto;
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  accent-color: var(--primary);
+}
+
+.ui-skin-swatch {
+  flex: 0 0 auto;
+  width: 1.25rem;
+  height: 2.75rem;
+  border-radius: 0.625rem;
+}
+
+.ui-skin-swatch-classic {
+  background: linear-gradient(180deg, var(--surface-highest), var(--surface-low));
+  box-shadow: inset 0 0 0 1px var(--outline-ghost);
+}
+
+.ui-skin-swatch-shield {
+  border-radius: 0.625rem 0.625rem 0.5rem 0.5rem;
+  background: linear-gradient(90deg, #050505, #1d1e1f 47%, #141415 53%, #040404);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    inset 0 0.4rem 0 -0.28rem #76b900;
+}
+
+.ui-skin-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.125rem;
+}
+
+.ui-skin-name {
+  font-size: 0.875rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.ui-skin-description {
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+/* ---------- Remote skin: SHIELD ---------- */
+
+.shield-remote {
+  --shield-green: #76b900;
+  --shield-glyph: #d9dcd6;
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: var(--shield-glyph);
+}
+
+.shield-body {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  /* Stays remote-sized while the window is still being resized. */
+  max-width: 200px;
+  height: 100%;
+  padding: 18px 16px 12px;
+  overflow: hidden;
+  border-radius: 100px 100px 86px 86px / 72px 72px 56px 56px;
+  /* Matte black with a soft highlight along the center ridge of the prism. */
+  background: linear-gradient(
+    90deg,
+    #040404 0%,
+    #101011 16%,
+    #1c1d1e 47%,
+    #141415 53%,
+    #0a0a0b 84%,
+    #030303 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.6);
+  -webkit-app-region: drag;
+}
+
+.shield-body button,
+.shield-body textarea,
+.shield-toast,
+.shield-sheet {
+  -webkit-app-region: no-drag;
+}
+
+.shield-top {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding-top: 2px;
+}
+
+.shield-mic-hole {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #000;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.14);
+}
+
+.shield-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(217, 220, 214, 0.7);
+}
+
+.shield-device {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shield-led {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #3a3a3a;
+}
+
+.shield-led-connected {
+  background: var(--shield-green);
+  box-shadow: 0 0 6px var(--shield-green);
+}
+
+.shield-led-connecting {
+  background: #d8a200;
+  animation: shield-blink 1.2s ease-in-out infinite;
+}
+
+.shield-led-error {
+  background: #e5484d;
+  box-shadow: 0 0 6px #e5484d;
+}
+
+.shield-toast {
+  position: absolute;
+  top: 56px;
+  right: 12px;
+  left: 12px;
+  z-index: 5;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(147, 0, 10, 0.9);
+  color: #ffdad6;
+  font-size: 11px;
+  line-height: 1.35;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.shield-key {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 35%, #242526 0%, #151516 70%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 2px 3px rgba(0, 0, 0, 0.75);
+  color: var(--shield-glyph);
+  transition:
+    transform 80ms ease,
+    color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.shield-key:hover:not(:disabled) {
+  color: #fff;
+}
+
+.shield-key:active:not(:disabled) {
+  transform: scale(0.94);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.85);
+}
+
+.shield-key:disabled {
+  opacity: 0.35;
+}
+
+.shield-remote :focus-visible {
+  outline: 2px solid var(--shield-green);
+  outline-offset: 2px;
+}
+
+/* Backlit glyphs. */
+.shield-glyph {
+  width: 20px;
+  height: 20px;
+  filter: drop-shadow(0 0 3px rgba(255, 255, 255, 0.25));
+}
+
+.shield-key-small {
+  width: 38px;
+  height: 38px;
+}
+
+.shield-key-small .shield-glyph {
+  width: 17px;
+  height: 17px;
+}
+
+.shield-key-listening {
+  color: var(--shield-green);
+  box-shadow:
+    0 0 0 2px var(--shield-green),
+    0 0 14px rgba(118, 185, 0, 0.55);
+  animation: shield-pulse 1.4s ease-in-out infinite;
+}
+
+.shield-row,
+.shield-columns {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0 6px;
+}
+
+.shield-column {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.shield-ring {
+  position: relative;
+  flex: 0 0 auto;
+  width: 150px;
+  height: 150px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 40%, #1f2021 0%, #151617 62%, #101011 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 2px 4px rgba(0, 0, 0, 0.75);
+}
+
+.shield-ring-key {
+  position: absolute;
+  width: 44px;
+  height: 44px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.shield-ring-key .shield-glyph {
+  width: 18px;
+  height: 18px;
+  opacity: 0.85;
+}
+
+.shield-ring-key:active:not(:disabled) {
+  transform: none;
+  background: rgba(255, 255, 255, 0.05);
+  box-shadow: none;
+}
+
+.shield-ring-up {
+  top: 3px;
+  left: 53px;
+}
+
+.shield-ring-down {
+  bottom: 3px;
+  left: 53px;
+}
+
+.shield-ring-left {
+  top: 53px;
+  left: 3px;
+}
+
+.shield-ring-right {
+  top: 53px;
+  right: 3px;
+}
+
+.shield-select {
+  position: absolute;
+  top: 42px;
+  left: 42px;
+  width: 66px;
+  height: 66px;
+  background: radial-gradient(circle at 50% 40%, #1b1c1d 0%, #0c0c0d 75%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 0 0 1px rgba(0, 0, 0, 0.65);
+}
+
+.shield-oval {
+  width: 74px;
+  height: 34px;
+  border-radius: 17px;
+}
+
+.shield-dock {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  width: 72%;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.shield-dock-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  color: rgba(217, 220, 214, 0.55);
+}
+
+.shield-dock-button:hover:not(:disabled),
+.shield-dock-button[aria-pressed='true'],
+.shield-dock-button[aria-expanded='true'] {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.shield-dock-button:disabled {
+  opacity: 0.35;
+}
+
+.shield-dock-glyph {
+  width: 17px;
+  height: 17px;
+}
+
+.shield-sheet {
+  position: absolute;
+  right: 10px;
+  bottom: 56px;
+  left: 10px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 18px;
+  background: rgba(28, 29, 30, 0.97);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.6),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.shield-textarea {
+  width: 100%;
+  padding: 8px;
+  resize: none;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: #0d0d0e;
+  color: #eee;
+  font-size: 12px;
+}
+
+.shield-sheet-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.shield-sheet-button {
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(217, 220, 214, 0.85);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.shield-sheet-primary {
+  background: var(--shield-green);
+  color: #0b0b0b;
+}
+
+.shield-sheet-button:disabled,
+.shield-sheet-item:disabled {
+  opacity: 0.4;
+}
+
+.shield-sheet-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  color: #e6e6e6;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.shield-sheet-item:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.shield-sheet-danger {
+  color: #ffb4ab;
+}
+
+@keyframes shield-blink {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@keyframes shield-pulse {
+  50% {
+    box-shadow:
+      0 0 0 2px var(--shield-green),
+      0 0 4px rgba(118, 185, 0, 0.3);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shield-led-connecting,
+  .shield-key-listening {
+    animation: none;
   }
 }

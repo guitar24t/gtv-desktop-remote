@@ -31,6 +31,7 @@ import type {
   SavedDevice,
   UpdaterStatus,
 } from './types';
+import type { WindowLayout } from './windowLayout';
 
 // ── INVOKE channels (request → response) ─────────────────────────────────────
 
@@ -65,6 +66,7 @@ export const INVOKE_CHANNELS = Object.freeze({
   updaterStatus: 'updater:status',
   updaterInstall: 'updater:install',
   updaterRollback: 'updater:rollback',
+  windowSetLayout: 'window:setLayout',
 } as const);
 
 export type InvokeChannelKey = keyof typeof INVOKE_CHANNELS;
@@ -102,6 +104,7 @@ export interface InvokeContract {
   updaterStatus: { args: []; res: UpdaterStatus };
   updaterInstall: { args: []; res: UpdaterStatus };
   updaterRollback: { args: []; res: UpdaterStatus };
+  windowSetLayout: { args: [WindowLayout]; res: undefined };
 }
 
 type _ContractParityCheck =

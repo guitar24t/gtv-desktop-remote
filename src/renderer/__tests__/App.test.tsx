@@ -104,6 +104,7 @@ function createMain(initial: BootstrapState, discovered: DiscoveredDevice[] = [d
     sendAssistantVoiceChunk: vi.fn((_sessionId: number, _chunk: string) => Promise.resolve()),
     stopAssistantVoice: vi.fn((_sessionId: number) => Promise.resolve()),
     hasPendingAssistantVoiceSession: vi.fn(() => Promise.resolve(false)),
+    setWindowLayout: vi.fn((_layout: string) => Promise.resolve()),
   };
   vi.stubGlobal('gtvRemote', api);
   return { api, main };
@@ -166,6 +167,7 @@ class FakeAudioContext {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  window.localStorage.clear();
   Reflect.deleteProperty(navigator, 'mediaDevices');
   FakeAudioContext.instances = [];
 });
@@ -529,5 +531,115 @@ describe('reset lives in Settings', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not remove certificates.');
     expect(screen.getByRole('heading', { name: 'Settings' })).toBeInTheDocument();
     expect(reset).toBeEnabled();
+  });
+});
+
+describe('remote skins', () => {
+  async function settle(api: ReturnType<typeof createMain>['api']) {
+    await waitFor(() => {
+      expect(api.scanDevices).toHaveBeenCalled();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+
+  it('uses the Classic skin and the standard window by default', async () => {
+    const { api } = await renderConnectedRemote();
+    expect(screen.getByRole('button', { name: 'Select' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: 'Rewind' })).toBeNull();
+    expect(api.setWindowLayout).toHaveBeenLastCalledWith('standard');
+  });
+
+  it('switches to SHIELD from Settings, remembers it, and shapes the window for the remote', async () => {
+    const { api } = await renderConnectedRemote();
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    await screen.findByRole('heading', { name: 'Settings' });
+    expect(api.setWindowLayout).toHaveBeenLastCalledWith('standard');
+
+    fireEvent.click(screen.getByRole('radio', { name: /SHIELD/ }));
+    expect(window.localStorage.getItem('gtv-remote.skin')).toBe('shield');
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+
+    expect(await screen.findByRole('button', { name: 'Rewind' })).toBeEnabled();
+    await waitFor(() => {
+      expect(api.setWindowLayout).toHaveBeenLastCalledWith('shield');
+    });
+    // The full-window skin replaces the app header.
+    expect(screen.queryByRole('button', { name: /Switch to (light|dark) theme/ })).toBeNull();
+  });
+
+  it('sends every SHIELD key, including the new media keys', async () => {
+    window.localStorage.setItem('gtv-remote.skin', 'shield');
+    const { api } = createMain({ devices: [savedTv], deviceState: connected });
+    render(<App />);
+    await settle(api);
+    const keys = [
+      ['Power', 'power'],
+      ['TV settings', 'menu'],
+      ['Up', 'up'],
+      ['Left', 'left'],
+      ['Right', 'right'],
+      ['Down', 'down'],
+      ['Select', 'select'],
+      ['Back', 'back'],
+      ['Home', 'home'],
+      ['Fast-forward', 'fast_forward'],
+      ['Play/Pause', 'play_pause'],
+      ['Rewind', 'rewind'],
+      ['Volume up', 'volume_up'],
+      ['Volume down', 'volume_down'],
+      ['Mute', 'mute'],
+    ] as const;
+    for (const [label] of keys) {
+      fireEvent.click(await screen.findByRole('button', { name: label }));
+    }
+    await waitFor(() => {
+      expect(api.sendCommand).toHaveBeenCalledTimes(keys.length);
+    });
+    expect(api.sendCommand.mock.calls.map(([request]) => request.command)).toEqual(
+      keys.map(([, command]) => command)
+    );
+  });
+
+  it('keeps app actions reachable from the SHIELD dock', async () => {
+    window.localStorage.setItem('gtv-remote.skin', 'shield');
+    const { api } = createMain({ devices: [savedTv], deviceState: connected });
+    render(<App />);
+    await settle(api);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Text' }));
+    fireEvent.change(screen.getByPlaceholderText('Type text to send to the TV'), {
+      target: { value: 'hello' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send Text' }));
+    await waitFor(() => {
+      expect(api.sendText).toHaveBeenCalledWith('hello');
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'More' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }));
+    await waitFor(() => {
+      expect(api.disconnect).toHaveBeenCalledTimes(1);
+    });
+    // Back on the device list, the window returns to the standard size.
+    await waitFor(() => {
+      expect(api.setWindowLayout).toHaveBeenLastCalledWith('standard');
+    });
+  });
+
+  it('sends media keys from the keyboard', async () => {
+    const { api } = await renderConnectedRemote();
+    fireEvent.keyDown(window, { key: '[' });
+    fireEvent.keyDown(window, { key: ']' });
+    fireEvent.keyDown(window, { key: 'm' });
+    await waitFor(() => {
+      expect(api.sendCommand).toHaveBeenCalledTimes(3);
+    });
+    expect(api.sendCommand.mock.calls.map(([request]) => request.command)).toEqual([
+      'rewind',
+      'fast_forward',
+      'mute',
+    ]);
   });
 });

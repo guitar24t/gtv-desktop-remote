@@ -9,6 +9,7 @@ import type {
   RemoteCommand,
   RemoteCommandSource,
 } from '../shared/types';
+import { isWindowLayout, type WindowLayout } from '../shared/windowLayout';
 
 /**
  * Runtime validation for renderer → main IPC payloads. TypeScript types end at
@@ -27,6 +28,10 @@ const REMOTE_COMMANDS = [
   'volume_up',
   'volume_down',
   'power',
+  'rewind',
+  'fast_forward',
+  'mute',
+  'menu',
   'assistant_press',
   'assistant_release',
 ] as const satisfies readonly RemoteCommand[];
@@ -192,4 +197,9 @@ export function requireVoiceChunk(value: unknown): string {
   const chunk = boundedString(value, 'voice chunk', MAX_VOICE_CHUNK_BASE64_LENGTH);
   if (!BASE64.test(chunk)) throw new Error('Invalid voice chunk.');
   return chunk;
+}
+
+export function requireWindowLayout(value: unknown): WindowLayout {
+  if (!isWindowLayout(value)) throw new Error('Invalid window layout.');
+  return value;
 }

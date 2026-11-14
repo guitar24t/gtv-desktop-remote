@@ -23,6 +23,10 @@ export const KEYBOARD_COMMAND_MAP: Partial<Record<string, RemoteCommand>> = {
   _: 'volume_down',
   p: 'power',
   P: 'power',
+  '[': 'rewind',
+  ']': 'fast_forward',
+  m: 'mute',
+  M: 'mute',
 };
 
 /**
@@ -37,6 +41,8 @@ const KEY_REPEAT_COMMANDS = new Set<RemoteCommand>([
   'right',
   'volume_up',
   'volume_down',
+  'rewind',
+  'fast_forward',
 ]);
 
 /** True when a held key (a `keydown` with `repeat`) may dispatch `command` again. */

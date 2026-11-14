@@ -5,11 +5,17 @@ import type { AppPreferences, PreferenceChange } from '../shared/preferences';
 import { getDesktopApi } from './api';
 import { shortcutLabel } from './lib/shortcut';
 import { ShortcutRecorder } from './ShortcutRecorder';
+import { REMOTE_SKINS, type RemoteSkinId } from './skins';
 
 export function Preferences({
+  skinId,
+  onSkinChange,
   onClose,
   onResetAppState,
 }: {
+  skinId: RemoteSkinId;
+  /** Applies immediately; the choice is remembered across launches. */
+  onSkinChange: (skin: RemoteSkinId) => void;
   onClose: () => void;
   /** Confirms with the user, then resets; rejects with a displayable error. */
   onResetAppState: () => Promise<void>;
@@ -98,6 +104,38 @@ export function Preferences({
         </button>
       </header>
       <div className="ui-settings-content">
+        <section className="ui-settings-group" aria-labelledby="skin-heading">
+          <h3 id="skin-heading" className="ui-settings-label">
+            Remote style
+          </h3>
+          <div className="ui-skin-options" role="radiogroup" aria-labelledby="skin-heading">
+            {REMOTE_SKINS.map((skin) => (
+              <label
+                key={skin.id}
+                className={`ui-skin-option${skin.id === skinId ? ' ui-skin-option-selected' : ''}`}
+              >
+                <input
+                  type="radio"
+                  name="remote-skin"
+                  value={skin.id}
+                  checked={skin.id === skinId}
+                  disabled={recording}
+                  aria-describedby={`skin-${skin.id}-description`}
+                  onChange={() => {
+                    onSkinChange(skin.id);
+                  }}
+                />
+                <span className={`ui-skin-swatch ui-skin-swatch-${skin.id}`} aria-hidden />
+                <span className="ui-skin-copy">
+                  <span className="ui-skin-name">{skin.name}</span>
+                  <span id={`skin-${skin.id}-description`} className="ui-skin-description">
+                    {skin.description}
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </section>
         {preferences ? (
           <>
             <section className="ui-settings-group" aria-labelledby="login-heading">
