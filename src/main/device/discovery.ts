@@ -172,15 +172,8 @@ export async function discoverGoogleTvDevices(): Promise<DiscoveredDevice[]> {
     ),
   ]);
 
-  const remoteByHost = new Map<string, ResolvedService>();
   const connectByHost = new Map<string, ResolvedService>();
   const pairingByHost = new Map<string, ResolvedService>();
-
-  for (const service of remoteServices) {
-    if (service?.host) {
-      remoteByHost.set(service.host, service);
-    }
-  }
 
   for (const service of adbConnectServices) {
     if (service?.host) {
@@ -215,32 +208,28 @@ export async function discoverGoogleTvDevices(): Promise<DiscoveredDevice[]> {
     });
   }
 
+  // Only hosts running Android TV Remote Service can be paired and controlled.
+  // Cast-only devices (Nest Hubs, Home speakers, speaker groups, TVs with
+  // Chromecast built-in) and ADB-only devices are not listed; their records just
+  // enrich a TV that also advertises the remote service.
   for (const service of castServices) {
-    if (!service?.host) {
+    const existing = service?.host ? devices.get(service.host) : undefined;
+    if (!service?.host || !existing) {
       continue;
     }
 
-    const existing = devices.get(service.host);
-    const remoteService = remoteByHost.get(service.host);
     const connectService = connectByHost.get(service.host);
     const pairService = pairingByHost.get(service.host);
-    const name = service.txt.fn || service.instanceName;
 
     devices.set(service.host, {
-      id: existing?.id ?? buildDiscoveredId(service.host, name),
-      name: existing?.name ?? name,
-      host: service.host,
-      networkHostName: existing?.networkHostName ?? service.hostName ?? remoteService?.hostName,
-      remotePort: existing?.remotePort ?? remoteService?.port,
+      ...existing,
+      networkHostName: existing.networkHostName ?? service.hostName,
       adbPort: connectService?.port,
-      pairingPort: existing?.pairingPort ?? pairService?.port,
-      macAddress: existing?.macAddress ?? remoteService?.txt.bt,
-      castDeviceId: service.txt.id || existing?.castDeviceId,
-      model: service.txt.md || existing?.model,
+      pairingPort: existing.pairingPort ?? pairService?.port,
+      castDeviceId: service.txt.id || existing.castDeviceId,
+      model: service.txt.md || existing.model,
       deviceFingerprint:
-        existing?.deviceFingerprint ??
-        buildDeviceFingerprint(existing?.name ?? name, service.txt.md),
-      source: existing?.source ?? (connectService || pairService ? 'adb' : 'googlecast'),
+        existing.deviceFingerprint ?? buildDeviceFingerprint(existing.name, service.txt.md),
     });
   }
 

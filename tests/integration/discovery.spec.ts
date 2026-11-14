@@ -5,34 +5,44 @@ for (const service of ['_androidtvremote2._tcp', '_googlecast._tcp', 'adb'] as c
     harness: h,
   }) => {
     const name = 'Synthetic: TV "Living Room" \\ café 世界';
-    await h.tv.setDiscovery([
-      {
-        name,
-        service,
-        host: h.tv.host,
-        port: h.tv.remotePort,
-        duplicate: 2,
-        txt: { id: 'synthetic-cast', fn: name, md: 'Synthetic Model', bt: '02:00:00:00:00:01' },
-      },
-    ]);
-    if (service === 'adb')
-      await h.tv.setDiscovery([
-        {
-          name,
-          service: '_googlecast._tcp',
-          host: h.tv.host,
-          duplicate: 2,
-          txt: { fn: name, md: 'Synthetic Model', id: 'synthetic-cast' },
-        },
-        { name, service: '_adb-tls-connect._tcp', host: h.tv.host, port: 5555 },
-        { name, service: '_adb-tls-pairing._tcp', host: h.tv.host, port: h.tv.pairingPort },
-      ]);
+    // Only hosts advertising the remote service are listed; Cast and ADB records
+    // with the same punctuation-heavy name must still parse and enrich that TV.
+    const remote = {
+      name,
+      service: '_androidtvremote2._tcp',
+      host: h.tv.host,
+      port: h.tv.remotePort,
+      duplicate: 2,
+      txt: { bt: '02:00:00:00:00:01' },
+    };
+    const cast = {
+      name,
+      service: '_googlecast._tcp',
+      host: h.tv.host,
+      duplicate: 2,
+      txt: { id: 'synthetic-cast', fn: name, md: 'Synthetic Model' },
+    };
+    await h.tv.setDiscovery(
+      service === '_androidtvremote2._tcp'
+        ? [remote]
+        : service === '_googlecast._tcp'
+          ? [remote, cast]
+          : [
+              remote,
+              cast,
+              { name, service: '_adb-tls-connect._tcp', host: h.tv.host, port: 5555 },
+              { name, service: '_adb-tls-pairing._tcp', host: h.tv.host, port: h.tv.pairingPort },
+            ]
+    );
     const records = await h.api('scanDevices');
     expect(records).toHaveLength(1);
     expect(records[0].name).toBe(name);
-    expect(records[0].source).toBe(
-      service === 'adb' ? 'adb' : service === '_googlecast._tcp' ? 'googlecast' : 'androidtvremote'
-    );
+    expect(records[0].source).toBe('androidtvremote');
+    expect(records[0].macAddress).toBe('02:00:00:00:00:01');
+    if (service !== '_androidtvremote2._tcp') {
+      expect(records[0].model).toBe('Synthetic Model');
+      expect(records[0].castDeviceId).toBe('synthetic-cast');
+    }
     if (service === 'adb') {
       expect(records[0].adbPort).toBe(5555);
       expect(records[0].pairingPort).toBe(h.tv.pairingPort);
@@ -41,6 +51,24 @@ for (const service of ['_androidtvremote2._tcp', '_googlecast._tcp', 'adb'] as c
     await expect(h.page.getByRole('button').filter({ hasText: name })).toHaveCount(1);
   });
 }
+
+test('DISCOVERY-NON-TV: Cast-only and ADB-only devices are not offered for pairing', async ({
+  harness: h,
+}) => {
+  await h.tv.setDiscovery([
+    {
+      name: 'Kitchen Display',
+      service: '_googlecast._tcp',
+      host: h.tv.host,
+      txt: { id: 'nest-hub', fn: 'Kitchen Display', md: 'Google Nest Hub' },
+    },
+    { name: 'Synthetic phone', service: '_adb-tls-connect._tcp', host: h.tv.host, port: 5555 },
+  ]);
+  expect(await h.api('scanDevices')).toEqual([]);
+  await h.page.getByRole('button', { name: "Don't see your device?", exact: true }).click();
+  await expect(h.page.getByText('No new devices detected right now.')).toBeVisible();
+  await expect(h.page.getByRole('button').filter({ hasText: 'Kitchen Display' })).toHaveCount(0);
+});
 
 for (const mode of ['empty', 'malformed', 'error'] as const) {
   test(`DISCOVERY-${mode}: scanner releases busy and subsequent refresh recovers`, async ({

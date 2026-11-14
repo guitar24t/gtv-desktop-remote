@@ -118,6 +118,71 @@ describe('discoverGoogleTvDevices — real dns-sd column format', () => {
     );
   });
 
+  it('lists only TVs with the remote service; Cast and ADB records just enrich them', async () => {
+    state.outputs.set(
+      '-B _androidtvremote2._tcp local.',
+      HEADER +
+        ' 0:05:10.480  Add        3  19 local.               _androidtvremote2._tcp. Living Room SHIELD\n'
+    );
+    state.outputs.set(
+      '-L Living Room SHIELD _androidtvremote2._tcp local.',
+      ' 0:14:27.399  Living\\032Room\\032SHIELD._androidtvremote2._tcp.local. can be reached at Android-2.local.:6466 (interface 19)\n bt=02:00:5E:00:00:01\n'
+    );
+    state.outputs.set(
+      '-B _googlecast._tcp local.',
+      HEADER +
+        ' 0:05:14.493  Add        3  19 local.               _googlecast._tcp.    SHIELD-Android-TV-0001\n' +
+        ' 0:05:14.493  Add        3  19 local.               _googlecast._tcp.    Google-Nest-Hub-0002\n' +
+        ' 0:05:14.493  Add        2  19 local.               _googlecast._tcp.    Google-Cast-Group-0003\n'
+    );
+    state.outputs.set(
+      '-L SHIELD-Android-TV-0001 _googlecast._tcp local.',
+      ' 0:14:30.001  SHIELD-Android-TV-0001._googlecast._tcp.local. can be reached at shield-0001.local.:8009 (interface 19)\n id=0001 md=SHIELD\\ Android\\ TV fn=Living\\ Room\\ SHIELD\n'
+    );
+    state.outputs.set(
+      '-L Google-Nest-Hub-0002 _googlecast._tcp local.',
+      ' 0:14:30.002  Google-Nest-Hub-0002._googlecast._tcp.local. can be reached at hub-0002.local.:8009 (interface 19)\n id=0002 md=Google\\ Nest\\ Hub fn=Kitchen\\ Display\n'
+    );
+    state.outputs.set(
+      '-L Google-Cast-Group-0003 _googlecast._tcp local.',
+      ' 0:14:30.003  Google-Cast-Group-0003._googlecast._tcp.local. can be reached at group-0003.local.:32190 (interface 19)\n id=0003 md=Google\\ Cast\\ Group fn=Todd\\ world\\ speakers\n'
+    );
+    state.outputs.set(
+      '-B _adb-tls-connect._tcp local.',
+      HEADER +
+        ' 0:05:15.000  Add        2  19 local.               _adb-tls-connect._tcp. adb-phone-0004\n'
+    );
+    state.outputs.set(
+      '-L adb-phone-0004 _adb-tls-connect._tcp local.',
+      ' 0:14:31.000  adb-phone-0004._adb-tls-connect._tcp.local. can be reached at phone-0004.local.:37000 (interface 19)\n'
+    );
+    const addresses: Record<string, string> = {
+      'Android-2.local.': '192.168.1.20',
+      'shield-0001.local.': '192.168.1.20',
+      'hub-0002.local.': '192.168.1.30',
+      'group-0003.local.': '192.168.1.31',
+      'phone-0004.local.': '192.168.1.40',
+    };
+    for (const [hostName, address] of Object.entries(addresses)) {
+      state.outputs.set(
+        `-G v4 ${hostName}`,
+        ` 0:15:01.150  Add  40000002      19  ${hostName}                       ${address}                                 120\n`
+      );
+    }
+
+    const devices = await discoverGoogleTvDevices();
+
+    expect(devices).toHaveLength(1);
+    expect(devices[0]).toMatchObject({
+      name: 'Living Room SHIELD',
+      host: '192.168.1.20',
+      macAddress: '02:00:5E:00:00:01',
+      model: 'SHIELD Android TV',
+      castDeviceId: '0001',
+      source: 'androidtvremote',
+    });
+  });
+
   it('stopDiscovery kills dns-sd children that are still running', async () => {
     state.exitAfterOutput = false;
     const scan = discoverGoogleTvDevices();
