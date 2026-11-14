@@ -23,10 +23,53 @@ export function normalizeVersion(value: string): string {
   return value.trim().replace(/^v/i, '');
 }
 
+interface ParsedVersion {
+  readonly core: number[];
+  readonly prerelease: string[];
+}
+
+function parseVersion(value: string): ParsedVersion {
+  // Build metadata (`+...`) never affects precedence.
+  const withoutBuild = normalizeVersion(value).split('+', 1)[0] ?? '';
+  const dash = withoutBuild.indexOf('-');
+  const coreText = dash === -1 ? withoutBuild : withoutBuild.slice(0, dash);
+  const prereleaseText = dash === -1 ? '' : withoutBuild.slice(dash + 1);
+  return {
+    core: coreText.split('.').map((part) => Number.parseInt(part, 10) || 0),
+    prerelease: prereleaseText ? prereleaseText.split('.') : [],
+  };
+}
+
+const NUMERIC_IDENTIFIER = /^\d+$/;
+
+function compareIdentifiers(left: string, right: string): -1 | 0 | 1 {
+  const leftNumeric = NUMERIC_IDENTIFIER.test(left);
+  const rightNumeric = NUMERIC_IDENTIFIER.test(right);
+  if (leftNumeric && rightNumeric) {
+    const a = Number(left);
+    const b = Number(right);
+    return a === b ? 0 : a > b ? 1 : -1;
+  }
+  // Numeric identifiers always have lower precedence than alphanumeric ones.
+  if (leftNumeric) return -1;
+  if (rightNumeric) return 1;
+  if (left === right) return 0;
+  return left > right ? 1 : -1;
+}
+
 /**
- * Numeric semver-ish comparator. Each version is split on `.`, each segment is
- * parsed as base-10 (non-numeric segments become 0), and segments are compared
- * pair-wise. Missing trailing segments are treated as 0 so `1.2` === `1.2.0`.
+ * Semver precedence comparator.
+ *
+ * The release core (`MAJOR.MINOR.PATCH`, or any number of dot-separated
+ * segments) is compared numerically pair-wise; non-numeric segments become 0
+ * and missing trailing segments are treated as 0, so `1.2` === `1.2.0`.
+ *
+ * When the cores are equal, prerelease identifiers follow semver §11:
+ * a version without a prerelease (`2.3.0`) is newer than any prerelease of
+ * it (`2.3.0-beta.1`); prerelease identifiers are compared left to right,
+ * numerically when both are numeric, lexically (ASCII) otherwise, with numeric
+ * identifiers ranking below alphanumeric ones and a longer identifier list
+ * winning when all preceding identifiers are equal. Build metadata is ignored.
  *
  * Returns:
  *   1  if `a` > `b`
@@ -34,22 +77,30 @@ export function normalizeVersion(value: string): string {
  *   0  otherwise
  */
 export function compareVersions(a: string, b: string): -1 | 0 | 1 {
-  const aParts = normalizeVersion(a)
-    .split('.')
-    .map((part) => Number.parseInt(part, 10) || 0);
-  const bParts = normalizeVersion(b)
-    .split('.')
-    .map((part) => Number.parseInt(part, 10) || 0);
+  const left = parseVersion(a);
+  const right = parseVersion(b);
 
-  const max = Math.max(aParts.length, bParts.length);
+  const max = Math.max(left.core.length, right.core.length);
   for (let i = 0; i < max; i += 1) {
-    const left = aParts[i] ?? 0;
-    const right = bParts[i] ?? 0;
-    if (left > right) return 1;
-    if (left < right) return -1;
+    const l = left.core[i] ?? 0;
+    const r = right.core[i] ?? 0;
+    if (l > r) return 1;
+    if (l < r) return -1;
   }
 
-  return 0;
+  if (left.prerelease.length === 0 || right.prerelease.length === 0) {
+    if (left.prerelease.length === right.prerelease.length) return 0;
+    return left.prerelease.length === 0 ? 1 : -1;
+  }
+
+  const identifiers = Math.min(left.prerelease.length, right.prerelease.length);
+  for (let i = 0; i < identifiers; i += 1) {
+    const result = compareIdentifiers(left.prerelease[i] ?? '', right.prerelease[i] ?? '');
+    if (result !== 0) return result;
+  }
+
+  if (left.prerelease.length === right.prerelease.length) return 0;
+  return left.prerelease.length > right.prerelease.length ? 1 : -1;
 }
 
 /**

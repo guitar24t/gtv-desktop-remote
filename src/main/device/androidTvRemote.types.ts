@@ -9,6 +9,11 @@ import type { PemPair } from './protocol/certificate';
 
 export interface RemoteClientPort {
   disconnect(): void;
+  /**
+   * True when this connection has observed TV pings but none recently, which
+   * indicates a half-open socket (e.g. after sleep/wake or a Wi-Fi change).
+   */
+  isStale(now?: number): boolean;
   connect(commandId?: string): Promise<void>;
   sendCommand(request: CommandDispatchRequest): Promise<void> | void;
   sendText(text: string): Promise<void> | void;
@@ -46,7 +51,23 @@ export interface RemoteState {
   imeCounter: number;
   imeFieldCounter: number;
   lastActivityAt: number;
+  /** When the TV last pinged this connection; undefined until the first ping. */
+  lastPingAt?: number;
   voiceSessionId?: number;
+}
+
+/**
+ * Identifies the saved device a bridge call is for. Credentials, sessions and
+ * the server pin are keyed by `deviceId`; `host` is where the TV is now.
+ */
+export interface DeviceTarget {
+  deviceId: string;
+  host: string;
+  /**
+   * Keys of pre-id credential files (MAC, then host) this device may adopt
+   * when it has no id-keyed pair yet. See `legacyCertKeysFor`.
+   */
+  legacyCertKeys?: readonly string[];
 }
 
 /**
@@ -59,6 +80,12 @@ export interface DeviceSession {
   pairingReady?: Promise<void>;
   remoteClient?: RemoteClientPort;
 }
+
+/**
+ * A connection that has seen TV pings but none for this long is treated as
+ * half-open and is replaced before the next command. TVs ping every ~5s.
+ */
+export const STALE_CONNECTION_MS = 15_000;
 
 /**
  * Android TV pairing port (default).
@@ -89,10 +116,42 @@ export function toError(error: unknown, fallback: string): Error {
   return new Error(fallback);
 }
 
+export const CERTIFICATE_REJECTED_MESSAGE =
+  'The TV rejected the saved pairing certificate. Start pairing again. If this keeps happening, remove this remote from the TV and pair again.';
+
+/** The TV refused our client certificate (TLS alert 46): pairing is needed. */
+export class CertificateRejectedError extends Error {
+  readonly code = 'CERTIFICATE_REJECTED';
+
+  constructor() {
+    super(CERTIFICATE_REJECTED_MESSAGE);
+    this.name = 'CertificateRejectedError';
+  }
+}
+
+/** The TV at `host` presented a different certificate than the pinned one. */
+export class ServerIdentityMismatchError extends Error {
+  readonly code = 'SERVER_IDENTITY_MISMATCH';
+
+  constructor(host: string) {
+    super(
+      `The device at ${host} does not match the paired TV. Rescan for devices, then try again. If the TV was reset, forget it and pair again.`
+    );
+    this.name = 'ServerIdentityMismatchError';
+  }
+}
+
 /**
  * Check if an error is a certificate rejection from the TV.
  */
 export function isCertificateRejectedError(error: unknown): boolean {
+  if (error instanceof CertificateRejectedError) {
+    return true;
+  }
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  if (code === 'ERR_SSL_SSLV3_ALERT_CERTIFICATE_UNKNOWN') {
+    return true;
+  }
   const message = toError(error, '').message;
   return message.includes('SSLV3_ALERT_CERTIFICATE_UNKNOWN') || message.includes('alert number 46');
 }
@@ -102,13 +161,15 @@ export function isCertificateRejectedError(error: unknown): boolean {
  * Handles certificate rejection, timeouts, and other common failures.
  */
 export function normalizeRemoteError(error: unknown, fallback: string): Error {
-  const normalized = toError(error, fallback);
-
-  if (isCertificateRejectedError(normalized)) {
-    return new Error(
-      'The TV rejected the saved pairing certificate. Start pairing again. If this keeps happening, remove this remote from the TV and pair again.'
-    );
+  if (error instanceof CertificateRejectedError || error instanceof ServerIdentityMismatchError) {
+    return error;
   }
+
+  if (isCertificateRejectedError(error)) {
+    return new CertificateRejectedError();
+  }
+
+  const normalized = toError(error, fallback);
 
   if (normalized.message.includes('Remote connection timed out.')) {
     return new Error(

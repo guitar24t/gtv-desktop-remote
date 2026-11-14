@@ -219,16 +219,65 @@ describe('accessible shortcut recording', () => {
     expect(view.onChange).not.toHaveBeenCalled();
   });
 
-  it('matches physical key release even when the glyph changes after modifier release', async () => {
+  it('matches physical key release even when the released glyph differs from the pressed one', async () => {
+    const view = setup();
+    fireEvent.focus(view.button);
+    await screen.findByText('Press a shortcut. Escape cancels.');
+    fireEvent.keyDown(view.button, { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true });
+    fireEvent.keyUp(view.button, { key: 'r', code: 'KeyR', ctrlKey: true, shiftKey: true });
+    expect(view.capture.mock.calls.map(([value]) => value)).toEqual([true]);
+    fireEvent.keyUp(view.button, { key: '1', code: 'Digit1', ctrlKey: true, shiftKey: true });
+    await waitFor(() => {
+      expect(view.onChange).toHaveBeenCalledWith('Control+Shift+1');
+    });
+  });
+
+  it('finishes with the captured chord when one of its modifiers is released first', async () => {
     const view = setup();
     fireEvent.focus(view.button);
     await screen.findByText('Press a shortcut. Escape cancels.');
     fireEvent.keyDown(view.button, { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true });
     fireEvent.keyUp(view.button, { key: 'Shift', code: 'ShiftLeft', ctrlKey: true });
-    expect(view.capture.mock.calls.map(([value]) => value)).toEqual([true]);
-    fireEvent.keyUp(view.button, { key: '1', code: 'Digit1', ctrlKey: true });
     await waitFor(() => {
       expect(view.onChange).toHaveBeenCalledWith('Control+Shift+1');
+    });
+    expect(view.capture.mock.calls.map(([value]) => value)).toEqual([true, false]);
+  });
+
+  it('records a Cmd chord when macOS withholds the letter keyup and Cmd is released', async () => {
+    const view = setup();
+    fireEvent.focus(view.button);
+    await screen.findByText('Press a shortcut. Escape cancels.');
+    fireEvent.keyDown(view.button, { key: 'Meta', code: 'MetaLeft', metaKey: true });
+    fireEvent.keyDown(view.button, {
+      key: 'Shift',
+      code: 'ShiftLeft',
+      metaKey: true,
+      shiftKey: true,
+    });
+    fireEvent.keyDown(view.button, { key: 'g', code: 'KeyG', metaKey: true, shiftKey: true });
+    expect(screen.getByRole('status')).toHaveTextContent('Release keys');
+    // No keyup for G arrives while Cmd is held; the Cmd release itself must finish.
+    fireEvent.keyUp(view.button, { key: 'Meta', code: 'MetaLeft', shiftKey: true });
+    await waitFor(() => {
+      expect(view.onChange).toHaveBeenCalledWith('Shift+Super+G');
+    });
+    expect(view.capture.mock.calls.map(([value]) => value)).toEqual([true, false]);
+    expect(view.button).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('keeps waiting when a modifier outside the captured chord is released', async () => {
+    const view = setup();
+    fireEvent.focus(view.button);
+    await screen.findByText('Press a shortcut. Escape cancels.');
+    fireEvent.keyDown(view.button, { key: 'g', code: 'KeyG', ctrlKey: true });
+    fireEvent.keyUp(view.button, { key: 'Alt', code: 'AltLeft', ctrlKey: true });
+    fireEvent.keyUp(view.button, { key: 'Meta', code: 'MetaLeft', ctrlKey: true });
+    expect(view.capture.mock.calls.map(([value]) => value)).toEqual([true]);
+    expect(screen.getByRole('status')).toHaveTextContent('Release keys');
+    fireEvent.keyUp(view.button, { key: 'Control', code: 'ControlLeft' });
+    await waitFor(() => {
+      expect(view.onChange).toHaveBeenCalledWith('Control+G');
     });
   });
 

@@ -1,20 +1,26 @@
 #!/usr/bin/env node
 /**
  * Fixture extractor — converts a captures/capture-*.ndjson session log into
- * golden fixture files under src/backend/**\/__fixtures__/.
+ * redacted, local-only fixture files for writing tests without a real TV.
  *
  * Usage:
  *   node scripts/extract-fixtures.mjs captures/capture-2026-05-20T...ndjson
  *   node scripts/extract-fixtures.mjs              # auto-picks the latest capture
+ *   node scripts/extract-fixtures.mjs <capture> --out-dir <dir>   # write elsewhere
  *
- * Output:
- *   src/backend/transport/framing/__fixtures__/inbound-frames.bin   (raw frames)
- *   src/backend/voice/__fixtures__/voice-session.json
- *   src/backend/__fixtures__/ipc-session.json
- *   src/backend/__fixtures__/discovery-session.json
+ * Output (relative to --out-dir, default src/backend; all paths are gitignored):
+ *   __fixtures__/ipc-session.json
+ *   discovery/__fixtures__/discovery-session.json
+ *   voice/__fixtures__/voice-session.json, voice-chunks-concatenated.bin
+ *   transport/framing/__fixtures__/inbound-frames-meta.json, frames/*.bin
  *
- * Each fixture file contains the minimal data needed to write or extend tests
- * without a real Google TV. Run this after GTV_CAPTURE=1 yarn dev.
+ * JSON outputs are redacted (typed text, pairing codes, voice audio, device
+ * names, IP/MAC addresses, home-directory paths, raw Electron event objects).
+ * Binary frames and voice audio cannot be redacted: never commit them. To add
+ * a committed fixture, review these files and copy only the minimal,
+ * anonymised data a test needs into a new, reviewed fixture file.
+ *
+ * Run this after GTV_CAPTURE=1 yarn dev.
  */
 
 import { Buffer } from 'node:buffer';
@@ -22,12 +28,31 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { buildIpcPairs, createRedactor } from './lib/capture-redaction.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const CAPTURES_DIR = path.join(ROOT, 'captures');
-const FIXTURES_ROOT = path.join(ROOT, 'src', 'backend');
 
-// ── resolve input file ────────────────────────────────────────────────────────
+// ── arguments ─────────────────────────────────────────────────────────────────
+
+function parseArgs(argv) {
+  const options = { input: undefined, outDir: path.join(ROOT, 'src', 'backend') };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--out-dir') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('--out-dir requires a directory');
+      options.outDir = path.resolve(value);
+      index += 1;
+    } else if (!options.input) {
+      options.input = arg;
+    } else {
+      throw new Error(`Unexpected argument: ${arg}`);
+    }
+  }
+  return options;
+}
 
 function findLatestCapture() {
   if (!fs.existsSync(CAPTURES_DIR)) {
@@ -46,8 +71,13 @@ function findLatestCapture() {
   return path.join(CAPTURES_DIR, files[0]);
 }
 
-const inputFile = process.argv[2] ?? findLatestCapture();
-console.log(`\n📂 Reading capture: ${inputFile}\n`);
+const options = parseArgs(process.argv.slice(2));
+const inputFile = options.input ?? findLatestCapture();
+const FIXTURES_ROOT = options.outDir;
+// Record only the capture's file name, never an absolute path with a username.
+const captureFile = path.basename(inputFile);
+const redactor = createRedactor();
+console.log(`\n📂 Reading capture: ${captureFile}\n`);
 
 // ── parse ndjson ──────────────────────────────────────────────────────────────
 
@@ -90,31 +120,12 @@ function writeBin(filePath, hexString) {
 
 // ── extract by layer ──────────────────────────────────────────────────────────
 
-// IPC session — all call/return pairs
-const ipcRecords = records.filter(
-  (r) =>
-    r.layer === 'ipc' && r.event !== 'capture-session-start' && r.event !== 'capture-session-end'
-);
-const ipcPairs = [];
-const callMap = new Map();
-for (const r of ipcRecords) {
-  if (r.direction === 'call') {
-    callMap.set(r.meta?.channel, r);
-  } else if (r.direction === 'return') {
-    const call = callMap.get(r.meta?.channel);
-    ipcPairs.push({
-      channel: r.meta?.channel,
-      args: call?.data,
-      result: r.data,
-      durationMs: r.durationMs,
-      error: r.error,
-    });
-    callMap.delete(r.meta?.channel);
-  }
-}
+// IPC session — all call/return pairs, redacted
+const ipcPairs = buildIpcPairs(records, redactor);
 if (ipcPairs.length) {
   writeJson(path.join(FIXTURES_ROOT, '__fixtures__', 'ipc-session.json'), {
-    captureFile: inputFile,
+    captureFile,
+    redacted: true,
     pairs: ipcPairs,
   });
 }
@@ -131,7 +142,7 @@ if (inboundFrames.length) {
   }));
   writeJson(
     path.join(FIXTURES_ROOT, 'transport', 'framing', '__fixtures__', 'inbound-frames-meta.json'),
-    { captureFile: inputFile, frameCount: inboundFrames.length, frames: frameMeta }
+    { captureFile, frameCount: inboundFrames.length, frames: frameMeta }
   );
   // write each frame as a separate .bin file (for byte-exact parseFramedBuffer tests)
   const framesDir = path.join(FIXTURES_ROOT, 'transport', 'framing', '__fixtures__', 'frames');
@@ -147,8 +158,14 @@ if (voiceRecords.length) {
   const voiceChunks = voiceRecords.filter((r) => r.event === 'voiceChunk');
   const voiceEvents = voiceRecords.filter((r) => r.event !== 'voiceChunk');
   writeJson(path.join(FIXTURES_ROOT, 'voice', '__fixtures__', 'voice-session.json'), {
-    captureFile: inputFile,
-    events: voiceEvents.map((r) => ({ seq: r.seq, ts: r.ts, event: r.event, meta: r.meta })),
+    captureFile,
+    redacted: true,
+    events: voiceEvents.map((r) => ({
+      seq: r.seq,
+      ts: r.ts,
+      event: r.event,
+      meta: redactor.redact(r.meta),
+    })),
     chunkCount: voiceChunks.length,
     totalBytes: voiceChunks.reduce((sum, r) => sum + (r.meta?.byteLength ?? 0), 0),
   });
@@ -165,13 +182,14 @@ if (voiceRecords.length) {
 const discoveryRecords = records.filter((r) => r.layer === 'discovery');
 if (discoveryRecords.length) {
   writeJson(path.join(FIXTURES_ROOT, 'discovery', '__fixtures__', 'discovery-session.json'), {
-    captureFile: inputFile,
+    captureFile,
+    redacted: true,
     events: discoveryRecords.map((r) => ({
       seq: r.seq,
       ts: r.ts,
       event: r.event,
-      data: r.data,
-      meta: r.meta,
+      data: redactor.redact(r.data),
+      meta: redactor.redact(r.meta),
     })),
   });
 }
@@ -181,11 +199,14 @@ if (discoveryRecords.length) {
 console.log(`
 ✅ Extraction complete.
 
-Fixture files are ready to use in tests. Next steps:
-  1. Review the generated JSON/bin files in src/backend/**/__fixtures__/
-  2. Add tests that load fixtures with:
-       const frames = fs.readdirSync(__fixtures__('frames')).map(...)
-       parseFramedBuffer(frame) // → match framing invariants
-  3. Commit the fixture files alongside new test files.
+The JSON files above are redacted: typed text, pairing codes, voice audio,
+device names, IP/MAC addresses and home-directory paths were replaced with
+placeholders. Raw protocol frames (*.bin) and voice audio are NOT redacted.
+
+These outputs are gitignored and are for local test development only:
+  1. Review the generated files by hand.
+  2. Copy only the minimal, anonymised data a test needs into a new fixture
+     file, and review that diff before committing it.
+  3. Never commit raw captures, frames or voice audio.
   4. Run: yarn test
 `);

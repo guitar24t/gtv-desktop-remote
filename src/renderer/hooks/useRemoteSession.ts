@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type {
   CommandDispatchRequest,
@@ -6,6 +6,7 @@ import type {
   RemoteCommandSource,
 } from '../../shared/types';
 import { getDesktopApi } from '../api';
+import { isConnectionUnavailableError } from '../lib/pure';
 import { BURST_SENSITIVE_COMMANDS, MAX_QUEUED_COMMANDS } from '../lib/remoteCommands';
 
 interface QueuedCommandBatch {
@@ -19,13 +20,20 @@ interface QueuedCommandBatch {
  *
  * @param onCommandError - callback when a command fails to send.
  *   Allows the hook to report errors without being tightly coupled to App's state.
+ *   It is not called for a command whose queue was cleared while it was in flight.
  */
 export function useRemoteSession(onCommandError?: (error: Error) => void) {
   const [busy, setBusy] = useState(false);
 
+  const onCommandErrorRef = useRef(onCommandError);
+  useEffect(() => {
+    onCommandErrorRef.current = onCommandError;
+  });
   const commandQueueRef = useRef<QueuedCommandBatch[]>([]);
   const queuedCommandCountRef = useRef(0);
   const isProcessingQueueRef = useRef(false);
+  // Bumped by clearCommandQueue so results of commands sent before the clear are ignored.
+  const queueGenerationRef = useRef(0);
 
   const createCommandRequest = useCallback(
     (command: RemoteCommand, source: RemoteCommandSource): CommandDispatchRequest => {
@@ -48,6 +56,17 @@ export function useRemoteSession(onCommandError?: (error: Error) => void) {
     });
   }, []);
 
+  /**
+   * Drops every queued command. A command already handed to main cannot be
+   * recalled, but its result (including a failure) is ignored, so it can no
+   * longer overwrite state for the session that replaced it.
+   */
+  const clearCommandQueue = useCallback(() => {
+    queueGenerationRef.current += 1;
+    commandQueueRef.current = [];
+    queuedCommandCountRef.current = 0;
+  }, []);
+
   const flushQueuedCommands = useCallback(async () => {
     if (isProcessingQueueRef.current) {
       return;
@@ -57,6 +76,7 @@ export function useRemoteSession(onCommandError?: (error: Error) => void) {
 
     try {
       while (commandQueueRef.current.length > 0) {
+        const generation = queueGenerationRef.current;
         const currentBatch = commandQueueRef.current[0];
         if (!currentBatch) {
           break;
@@ -68,15 +88,30 @@ export function useRemoteSession(onCommandError?: (error: Error) => void) {
           continue;
         }
 
+        let failure: Error | undefined;
         try {
           await getDesktopApi().sendCommand(request);
         } catch (error) {
-          onCommandError?.(error instanceof Error ? error : new Error(String(error)));
-        } finally {
-          queuedCommandCountRef.current = Math.max(0, queuedCommandCountRef.current - 1);
-          if (currentBatch.requests.length === 0) {
-            commandQueueRef.current.shift();
+          failure = error instanceof Error ? error : new Error(String(error));
+        }
+
+        if (generation !== queueGenerationRef.current) {
+          // The queue was cleared while this command was in flight; the
+          // queue now holds only commands for the current session.
+          continue;
+        }
+
+        queuedCommandCountRef.current = Math.max(0, queuedCommandCountRef.current - 1);
+        if (currentBatch.requests.length === 0) {
+          commandQueueRef.current.shift();
+        }
+
+        if (failure) {
+          if (isConnectionUnavailableError(failure.message)) {
+            // Every remaining command would fail the same way.
+            clearCommandQueue();
           }
+          onCommandErrorRef.current?.(failure);
         }
       }
     } finally {
@@ -85,7 +120,7 @@ export function useRemoteSession(onCommandError?: (error: Error) => void) {
         void flushQueuedCommands();
       }
     }
-  }, [onCommandError]);
+  }, [clearCommandQueue]);
 
   const enqueueCommand = useCallback(
     (request: CommandDispatchRequest) => {
@@ -128,5 +163,6 @@ export function useRemoteSession(onCommandError?: (error: Error) => void) {
     busy,
     setBusy,
     handleCommand,
+    clearCommandQueue,
   };
 }

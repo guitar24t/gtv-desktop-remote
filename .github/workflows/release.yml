@@ -14,9 +14,13 @@ name: Release
 #   artifacts.
 #
 # Job 2 (release): runs the real semantic-release, downloads the DMG + ZIP
-#   artifacts, and attaches them to the GitHub Release.
+#   artifacts, and attaches them to the GitHub Release. When the repository
+#   variable HOMEBREW_TAP_REPOSITORY (`owner/repo`) is set, it also updates the
+#   cask in that tap; otherwise the Homebrew steps are skipped.
 #
 # Built-in GitHub token is used for checkout and read-only repository access.
+# Writes use short-lived GitHub App tokens scoped to this repository (and the
+# tap, when configured).
 
 on:
   workflow_dispatch:
@@ -38,7 +42,7 @@ permissions:
 # the `environment: production` on each job, which requires an approver
 # configured in repo Settings → Environments → production.
 env:
-  RELEASE_ALLOWED_ACTORS: 'usrivastava92'
+  RELEASE_ALLOWED_ACTORS: 'guitar24t'
 
 jobs:
   # ── Job 0: actor allow-list preflight ────────────────────────────────────
@@ -82,7 +86,11 @@ jobs:
     steps:
       - name: Record trigger reason
         if: ${{ inputs.reason != '' }}
-        run: echo "Manual release reason — ${{ inputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
+        # Free-form input is passed through the environment, never interpolated
+        # into the script, so it cannot inject shell commands.
+        env:
+          RELEASE_REASON: ${{ inputs.reason }}
+        run: printf 'Manual release reason — %s\n' "$RELEASE_REASON" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/checkout@v7
         with:
@@ -122,11 +130,13 @@ jobs:
 
       - name: Patch package.json to next version
         if: steps.dry-run.outputs.will_release == 'true'
+        env:
+          NEXT_VERSION: ${{ steps.dry-run.outputs.version }}
         run: |
           node -e "
             const fs = require('fs');
             const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-            pkg.version = '${{ steps.dry-run.outputs.version }}';
+            pkg.version = process.env.NEXT_VERSION;
             fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
 
@@ -206,8 +216,8 @@ jobs:
         with:
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: usrivastava92
-          repositories: gtv-desktop-remote
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
           permission-contents: write
 
       - name: Verify semantic-release version policy
@@ -240,26 +250,54 @@ jobs:
           GITHUB_TOKEN: ${{ steps.source-token.outputs.token }}
         run: yarn semantic-release
 
+      # ── Optional Homebrew tap ──────────────────────────────────────────────
+      # Set the repository variable HOMEBREW_TAP_REPOSITORY (e.g.
+      # `guitar24t/homebrew-tap`) to publish the cask; the GitHub App must be
+      # installed on that repository. Unset, these steps are skipped.
+      - name: Skip Homebrew tap (not configured)
+        if: ${{ vars.HOMEBREW_TAP_REPOSITORY == '' }}
+        run: echo "HOMEBREW_TAP_REPOSITORY is not set; skipping the Homebrew tap update." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve Homebrew tap repository
+        id: tap
+        if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' }}
+        env:
+          TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+        run: |
+          if ! printf '%s' "$TAP_REPOSITORY" | grep -Eq '^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$'; then
+            echo "HOMEBREW_TAP_REPOSITORY must look like owner/repo." >&2
+            exit 1
+          fi
+          {
+            echo "repository=$TAP_REPOSITORY"
+            echo "owner=${TAP_REPOSITORY%%/*}"
+            echo "name=${TAP_REPOSITORY#*/}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Mint Homebrew tap App token
         id: tap-token
+        if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: usrivastava92
-          repositories: homebrew-tap
+          owner: ${{ steps.tap.outputs.owner }}
+          repositories: ${{ steps.tap.outputs.name }}
           permission-contents: write
 
       - name: Checkout Homebrew tap
+        if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          repository: usrivastava92/homebrew-tap
+          repository: ${{ steps.tap.outputs.repository }}
           ref: main
           path: homebrew-tap
           token: ${{ steps.tap-token.outputs.token }}
+          # This step pushes the updated cask, so it keeps its credentials.
           persist-credentials: true
 
       - name: Update Homebrew tap
+        if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' }}
         env:
           GITHUB_TOKEN: ${{ steps.source-token.outputs.token }}
           RELEASE_VERSION: ${{ needs.build-macos.outputs.next-version }}

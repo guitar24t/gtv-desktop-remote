@@ -6,6 +6,8 @@ import type {
   DeviceCapabilities,
   DeviceDraft,
   DiscoveredDevice,
+  RemoteCommand,
+  RemoteCommandSource,
   SavedDevice,
 } from '../shared/types';
 
@@ -13,6 +15,7 @@ import { useDeviceScanner } from './hooks/useDeviceScanner';
 import { usePairingFlow } from './hooks/usePairingFlow';
 import { useRemoteSession } from './hooks/useRemoteSession';
 import { useUpdaterStatus } from './hooks/useUpdaterStatus';
+import { withTimeout } from './lib/async';
 import {
   derivePairedNetworkDevices,
   deriveUnpairedNetworkDevices,
@@ -21,7 +24,8 @@ import {
   type DevicePickerSelection as DevicePickerSelectionFromLib,
 } from './lib/deviceSelection';
 import { classes, isEditableTarget, sanitizePairCode, shouldRestartPairingFlow } from './lib/pure';
-import { KEYBOARD_COMMAND_MAP } from './lib/remoteCommands';
+import { allowsKeyRepeat, KEYBOARD_COMMAND_MAP } from './lib/remoteCommands';
+import { isRemoteSessionStatus, resolveRemoteError } from './lib/remoteState';
 import { Preferences } from './Preferences';
 
 const initialDraft: DeviceDraft = {
@@ -34,6 +38,10 @@ const initialDraft: DeviceDraft = {
 const ASSISTANT_VOICE_MIN_CHUNK_BYTES = 8 * 1024;
 const ASSISTANT_VOICE_INITIAL_CHUNK_BYTES = 8 * 1024;
 const ASSISTANT_VOICE_STREAM_CHUNK_BYTES = 20 * 1024;
+// Upper bounds for voice teardown IPC so a hung call cannot leave voice unable to restart.
+const ASSISTANT_VOICE_DRAIN_TIMEOUT_MS = 3000;
+const ASSISTANT_VOICE_STOP_TIMEOUT_MS = 3000;
+const ASSISTANT_AUDIO_CLOSE_TIMEOUT_MS = 1000;
 
 type DevicePickerSelection = DevicePickerSelectionFromLib;
 
@@ -330,15 +338,18 @@ function App() {
     powerToggle: true,
   });
   const [devicePickerOpen, setDevicePickerOpen] = useState(true);
-  const { busy, setBusy, handleCommand } = useRemoteSession((error: Error) => {
-    setBootstrap((current) => ({
-      ...current,
-      deviceState: {
-        ...current.deviceState,
-        status: 'error',
-        message: error.message,
-      },
-    }));
+  // Non-fatal remote errors (failed key, text, voice, or microphone) are shown here
+  // without touching the connection status, which only main can decide.
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  // Bumped by every explicit device action. Async results that started under an
+  // older value belong to a session the user has since left, so they are ignored.
+  const deviceActionEpochRef = useRef(0);
+  const remoteSyncRef = useRef<{ running: boolean; pendingMessage: string | null }>({
+    running: false,
+    pendingMessage: null,
+  });
+  const { busy, setBusy, handleCommand, clearCommandQueue } = useRemoteSession((error: Error) => {
+    reportRemoteError(error);
   });
   const { discoveredDevices, setDiscoveredDevices, scanning, handleScanDevices } =
     useDeviceScanner();
@@ -378,6 +389,7 @@ function App() {
   const assistantChunkQueueRef = useRef<Promise<void>>(Promise.resolve());
   const assistantChunkCountRef = useRef(0);
   const assistantFirstChunkSentRef = useRef(false);
+  const assistantEpochRef = useRef(0);
 
   const findDiscoveredForSaved = (savedDevice: { host: string; macAddress?: string }) =>
     findDiscoveredForSavedPure(savedDevice, discoveredDevices);
@@ -408,7 +420,7 @@ function App() {
     ? 'pairing'
     : !devicePickerOpen &&
         currentRemoteDevice &&
-        (isConnected || bootstrap.deviceState.status === 'connecting')
+        isRemoteSessionStatus(bootstrap.deviceState.status)
       ? 'remote'
       : 'devices';
   const bridgeDisabled = busy || !bridgeReady;
@@ -426,6 +438,84 @@ function App() {
     const nextBootstrap = await getDesktopApi().bootstrap();
     setBootstrap(nextBootstrap);
     return nextBootstrap;
+  }
+
+  /**
+   * Starts an explicit device action (select, pair, connect, disconnect, forget,
+   * reset, or leaving the remote): drops leftover key commands so they cannot
+   * reach whichever TV main has active next, clears the remote error banner, and
+   * invalidates async results from the previous session.
+   */
+  function beginDeviceAction(): number {
+    deviceActionEpochRef.current += 1;
+    clearCommandQueue();
+    setRemoteError(null);
+    return deviceActionEpochRef.current;
+  }
+
+  /** Re-reads saved devices (pairing flags included) from main, keeping the current device state. */
+  async function refreshDevicesFromMain() {
+    try {
+      const { devices } = await getDesktopApi().bootstrap();
+      setBootstrap((current) => ({ ...current, devices }));
+    } catch {
+      // Keep the current list; the next scan or action refreshes it again.
+    }
+  }
+
+  /**
+   * Shows a non-fatal remote error in the remote view, then asks main whether the
+   * TV is still connected. Only main's answer can close the remote view.
+   * Uses only refs and state setters, so stale closures (hook callbacks, effects)
+   * can call it safely.
+   */
+  function reportRemoteError(error: unknown, epoch = deviceActionEpochRef.current) {
+    if (epoch !== deviceActionEpochRef.current) {
+      return;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    setRemoteError(message);
+    void syncRemoteStateAfterError(message);
+  }
+
+  async function syncRemoteStateAfterError(message: string) {
+    const sync = remoteSyncRef.current;
+    if (sync.running) {
+      // Re-check once the in-flight read finishes; main may have changed since it started.
+      sync.pendingMessage = message;
+      return;
+    }
+
+    sync.running = true;
+    let nextMessage: string | null = message;
+    try {
+      while (nextMessage !== null) {
+        const errorMessage: string = nextMessage;
+        sync.pendingMessage = null;
+        const epoch = deviceActionEpochRef.current;
+        let mainState: BootstrapState;
+        try {
+          mainState = await getDesktopApi().bootstrap();
+        } catch {
+          // Main is unreachable; keep the remote error visible.
+          break;
+        }
+
+        if (epoch === deviceActionEpochRef.current) {
+          const resolution = resolveRemoteError(mainState, errorMessage);
+          if (!resolution.stayInRemote) {
+            beginDeviceAction();
+            setTextInputOpen(false);
+          }
+          setBootstrap(resolution.bootstrap);
+        }
+        nextMessage = sync.pendingMessage;
+      }
+    } finally {
+      sync.running = false;
+      sync.pendingMessage = null;
+    }
   }
 
   // Wrapped handleScanDevices from the hook to add App-level state updates
@@ -520,6 +610,18 @@ function App() {
     }
   }, [activeSavedDevice, selectedDeviceKey]);
 
+  const previousViewRef = useRef(currentView);
+  useEffect(() => {
+    const previousView = previousViewRef.current;
+    previousViewRef.current = currentView;
+    if (previousView === 'remote' && currentView !== 'remote') {
+      // Nothing queued or still running for the remote session may act after it closes.
+      deviceActionEpochRef.current += 1;
+      clearCommandQueue();
+      setRemoteError(null);
+    }
+  }, [currentView, clearCommandQueue]);
+
   useEffect(() => {
     if (!bridgeReady || currentView !== 'devices') {
       return;
@@ -556,6 +658,12 @@ function App() {
     }
   }, [pairingReady, pairCodeInputRef]);
 
+  /** Sends a remote key; a new attempt replaces any previous remote error. */
+  function sendRemoteCommand(command: RemoteCommand, source?: RemoteCommandSource) {
+    setRemoteError(null);
+    handleCommand(command, source);
+  }
+
   function clearAssistantLongPressTimer() {
     if (assistantLongPressTimerRef.current !== null) {
       window.clearTimeout(assistantLongPressTimerRef.current);
@@ -575,28 +683,51 @@ function App() {
 
     assistantStoppingRef.current = true;
     assistantActiveRef.current = false;
+    const sessionEpoch = assistantEpochRef.current;
     const sessionId = assistantVoiceSessionIdRef.current;
-    assistantVoiceSessionIdRef.current = null;
     const sentChunks = assistantChunkCountRef.current;
-    const remaining = assistantAudioBufferRef.current;
-    let chunkQueue = assistantChunkQueueRef.current;
-    assistantAudioBufferRef.current = new Uint8Array(0);
-    assistantChunkCountRef.current = 0;
-    assistantFirstChunkSentRef.current = false;
-
-    const processor = assistantProcessorRef.current;
-    const stream = assistantMediaStreamRef.current;
-    const context = assistantAudioContextRef.current;
-    assistantProcessorRef.current = null;
-    assistantMediaStreamRef.current = null;
-    assistantAudioContextRef.current = null;
     let failure = captureError;
     try {
-      if (processor) {
-        // eslint-disable-next-line @typescript-eslint/no-deprecated
-        processor.onaudioprocess = null;
-        processor.disconnect();
+      assistantVoiceSessionIdRef.current = null;
+      const remaining = assistantAudioBufferRef.current;
+      let chunkQueue = assistantChunkQueueRef.current;
+      assistantAudioBufferRef.current = new Uint8Array(0);
+      assistantChunkCountRef.current = 0;
+      assistantFirstChunkSentRef.current = false;
+
+      const processor = assistantProcessorRef.current;
+      const stream = assistantMediaStreamRef.current;
+      const context = assistantAudioContextRef.current;
+      assistantProcessorRef.current = null;
+      assistantMediaStreamRef.current = null;
+      assistantAudioContextRef.current = null;
+
+      // 1. Release the microphone before waiting on any IPC, so capture ends now
+      //    rather than after queued chunks finish sending.
+      try {
+        if (processor) {
+          // eslint-disable-next-line @typescript-eslint/no-deprecated
+          processor.onaudioprocess = null;
+          processor.disconnect();
+        }
+      } catch (error) {
+        failure ??= error;
       }
+      if (stream) {
+        for (const track of stream.getTracks()) {
+          track.stop();
+        }
+      }
+      const contextClosed =
+        context && context.state !== 'closed'
+          ? withTimeout(
+              context.close(),
+              ASSISTANT_AUDIO_CLOSE_TIMEOUT_MS,
+              'Microphone audio did not close.'
+            ).catch(() => undefined)
+          : Promise.resolve();
+
+      // 2. Drain already-captured PCM, bounded so a hung send cannot block voice forever.
       if (sessionId !== null && remaining.length > 0 && failure === undefined) {
         const finalSize = Math.max(ASSISTANT_VOICE_MIN_CHUNK_BYTES, remaining.length);
         const padded = new Uint8Array(finalSize);
@@ -605,45 +736,37 @@ function App() {
           await getDesktopApi().sendAssistantVoiceChunk(sessionId, toBase64(padded));
         });
       }
-      await chunkQueue;
-    } catch (error) {
-      failure ??= error;
-    } finally {
-      if (stream) {
-        for (const track of stream.getTracks()) {
-          track.stop();
-        }
-      }
-      // Backend cleanup must run even when the PCM queue has rejected.
       try {
-        if (sessionId !== null) {
-          await getDesktopApi().stopAssistantVoice(sessionId);
-        }
+        await withTimeout(
+          chunkQueue,
+          ASSISTANT_VOICE_DRAIN_TIMEOUT_MS,
+          'Voice audio took too long to send to the TV.'
+        );
       } catch (error) {
         failure ??= error;
-      } finally {
+      }
+
+      // 3. Backend cleanup must run even when the PCM queue rejected or timed out.
+      if (sessionId !== null) {
         try {
-          if (context && context.state !== 'closed') {
-            await context.close();
-          }
+          await withTimeout(
+            getDesktopApi().stopAssistantVoice(sessionId),
+            ASSISTANT_VOICE_STOP_TIMEOUT_MS,
+            'The TV took too long to end the voice session.'
+          );
         } catch (error) {
           failure ??= error;
-        } finally {
-          assistantStoppingRef.current = false;
         }
       }
+
+      await contextClosed;
+    } finally {
+      assistantStoppingRef.current = false;
     }
 
     if (failure !== undefined) {
       setAssistantStatus('error');
-      setBootstrap((current) => ({
-        ...current,
-        deviceState: {
-          ...current.deviceState,
-          status: 'error',
-          message: (failure as Error).message,
-        },
-      }));
+      reportRemoteError(failure, sessionEpoch);
     } else {
       setAssistantStatus('idle');
       if (sessionId !== null) {
@@ -671,6 +794,9 @@ function App() {
 
     assistantStartingRef.current = true;
     assistantActiveRef.current = true;
+    const sessionEpoch = deviceActionEpochRef.current;
+    assistantEpochRef.current = sessionEpoch;
+    setRemoteError(null);
     const sessionToken = assistantSessionTokenRef.current + 1;
     assistantSessionTokenRef.current = sessionToken;
     assistantChunkQueueRef.current = Promise.resolve();
@@ -791,14 +917,7 @@ function App() {
       if (assistantSessionTokenRef.current === sessionToken) {
         assistantActiveRef.current = false;
         setAssistantStatus('error');
-        setBootstrap((current) => ({
-          ...current,
-          deviceState: {
-            ...current.deviceState,
-            status: 'error',
-            message: (error as Error).message,
-          },
-        }));
+        reportRemoteError(error, sessionEpoch);
       }
     } finally {
       try {
@@ -817,13 +936,19 @@ function App() {
             }
             try {
               if (sessionId !== null) {
-                await getDesktopApi()
-                  .stopAssistantVoice(sessionId)
-                  .catch(() => undefined);
+                await withTimeout(
+                  getDesktopApi().stopAssistantVoice(sessionId),
+                  ASSISTANT_VOICE_STOP_TIMEOUT_MS,
+                  'The TV took too long to end the voice session.'
+                ).catch(() => undefined);
               }
             } finally {
               if (audioContext && audioContext.state !== 'closed') {
-                await audioContext.close().catch(() => undefined);
+                await withTimeout(
+                  audioContext.close(),
+                  ASSISTANT_AUDIO_CLOSE_TIMEOUT_MS,
+                  'Microphone audio did not close.'
+                ).catch(() => undefined);
               }
             }
           }
@@ -963,7 +1088,11 @@ function App() {
       }
 
       event.preventDefault();
-      handleCommand(command, 'keyboard');
+      // A held key auto-repeats; only navigation and volume may act more than once.
+      if (event.repeat && !allowsKeyRepeat(command)) {
+        return;
+      }
+      sendRemoteCommand(command, 'keyboard');
     }
 
     function onKeyUp(event: KeyboardEvent) {
@@ -1030,6 +1159,7 @@ function App() {
   }
 
   async function handleSelectSavedDevice(deviceId: string) {
+    beginDeviceAction();
     setTextInputOpen(false);
     setPairCode('');
     setPairingReady(false);
@@ -1038,13 +1168,28 @@ function App() {
     setPairingDeviceId(deviceId);
 
     if (bootstrap.deviceState.activeDeviceId === deviceId && isConnected) {
-      return;
+      // Reuse the live session only if main, the authority, agrees it is still connected.
+      setBusy(true);
+      try {
+        const mainState = await refreshState();
+        if (
+          mainState.deviceState.status === 'connected' &&
+          mainState.deviceState.activeDeviceId === deviceId
+        ) {
+          return;
+        }
+      } catch {
+        // Fall through and reconnect.
+      } finally {
+        setBusy(false);
+      }
     }
 
     await handleConnect(deviceId);
   }
 
   async function handleSelectDiscoveredDevice(device: DiscoveredDevice) {
+    beginDeviceAction();
     setTextInputOpen(false);
     setPairCode('');
     setPairingReady(false);
@@ -1086,6 +1231,7 @@ function App() {
       return;
     }
 
+    beginDeviceAction();
     setBusy(true);
     try {
       await getDesktopApi().pair({
@@ -1101,6 +1247,8 @@ function App() {
 
       const connectingDeviceState = await getDesktopApi().connect(device.id);
       setBootstrap((current) => ({ ...current, deviceState: connectingDeviceState }));
+      // Pick up isPaired from main so the TV is listed under Known Devices, not as new.
+      await refreshDevicesFromMain();
     } catch (error) {
       const message = (error as Error).message;
       if (shouldRestartPairingFlow(message)) {
@@ -1116,6 +1264,8 @@ function App() {
           message,
         },
       }));
+      // Pairing may have succeeded before the connect failed, or main may have reset isPaired.
+      await refreshDevicesFromMain();
     } finally {
       setBusy(false);
     }
@@ -1126,6 +1276,7 @@ function App() {
     try {
       const deviceState = await getDesktopApi().connect(deviceId);
       setBootstrap((current) => ({ ...current, deviceState }));
+      await refreshDevicesFromMain();
     } catch (error) {
       setBootstrap((current) => ({
         ...current,
@@ -1135,26 +1286,23 @@ function App() {
           message: (error as Error).message,
         },
       }));
+      // Main clears isPaired when the TV rejects the saved certificate, which
+      // moves the TV back to New Devices Found so it can be paired again.
+      await refreshDevicesFromMain();
     } finally {
       setBusy(false);
     }
   }
 
   async function handleDisconnect() {
+    beginDeviceAction();
     setBusy(true);
     try {
       const deviceState = await getDesktopApi().disconnect();
       setBootstrap((current) => ({ ...current, deviceState }));
       setTextInputOpen(false);
     } catch (error) {
-      setBootstrap((current) => ({
-        ...current,
-        deviceState: {
-          ...current.deviceState,
-          status: 'error',
-          message: (error as Error).message,
-        },
-      }));
+      reportRemoteError(error);
     } finally {
       setBusy(false);
     }
@@ -1165,6 +1313,8 @@ function App() {
       return;
     }
 
+    const epoch = deviceActionEpochRef.current;
+    setRemoteError(null);
     setBusy(true);
     try {
       await getDesktopApi().sendText(textInput);
@@ -1178,36 +1328,41 @@ function App() {
         },
       }));
     } catch (error) {
-      setBootstrap((current) => ({
-        ...current,
-        deviceState: {
-          ...current.deviceState,
-          status: 'error',
-          message: (error as Error).message,
-        },
-      }));
+      reportRemoteError(error, epoch);
     } finally {
       setBusy(false);
     }
   }
 
   async function handleRemove(deviceId: string) {
+    const epoch = beginDeviceAction();
     setBusy(true);
     try {
       const devices = await getDesktopApi().removeDevice(deviceId);
-      setBootstrap((current) => ({
-        ...current,
-        devices,
-        deviceState: {
-          ...current.deviceState,
-          message: 'Device removed.',
-        },
-      }));
+      let nextBootstrap: BootstrapState;
+      try {
+        // Main resets its device state when the removed TV was active.
+        nextBootstrap = await getDesktopApi().bootstrap();
+      } catch {
+        nextBootstrap = {
+          devices,
+          deviceState:
+            bootstrap.deviceState.activeDeviceId === deviceId
+              ? { status: 'idle', message: 'Device removed.' }
+              : bootstrap.deviceState,
+        };
+      }
+      setBootstrap({
+        devices: nextBootstrap.devices,
+        deviceState: { ...nextBootstrap.deviceState, message: 'Device removed.' },
+      });
       setPairingDeviceId((current) => (current === deviceId ? '' : current));
       setPairingReady(false);
       setTextInputOpen(false);
       setDevicePickerOpen(true);
       setSelectedDeviceKey((current) => (current === `saved:${deviceId}` ? '' : current));
+    } catch (error) {
+      reportRemoteError(error, epoch);
     } finally {
       setBusy(false);
     }
@@ -1221,6 +1376,7 @@ function App() {
       return;
     }
 
+    beginDeviceAction();
     setBusy(true);
     try {
       const deviceState = await getDesktopApi().resetState();
@@ -1278,6 +1434,7 @@ function App() {
   }
 
   function openDevicePicker() {
+    beginDeviceAction();
     setTextInputOpen(false);
     setPairingReady(false);
     setPairCode('');
@@ -1640,7 +1797,7 @@ function App() {
                   <div className="ui-help">
                     <button
                       className="ui-help-chip"
-                      disabled={bridgeDisabled}
+                      disabled={bridgeDisabled || scanning}
                       onClick={() => {
                         void appHandleScanDevices(false);
                       }}
@@ -1714,6 +1871,8 @@ function App() {
                   className="sr-only-input"
                   value={pairCode}
                   onChange={(event) => {
+                    // No maxLength: it would cut pasted text such as "AB12 CD" before
+                    // separators are stripped. sanitizePairCode caps the result at 6.
                     setPairCode(sanitizePairCode(event.target.value));
                   }}
                   onKeyDown={(event) => {
@@ -1721,7 +1880,6 @@ function App() {
                       void handlePair();
                     }
                   }}
-                  maxLength={6}
                   autoComplete="one-time-code"
                 />
 
@@ -1760,9 +1918,7 @@ function App() {
                   </div>
                 </section>
 
-                {bootstrap.deviceState.status === 'error' ? (
-                  <div className="ui-alert mx-6 mb-3 mt-0">{bootstrap.deviceState.message}</div>
-                ) : null}
+                {remoteError ? <div className="ui-alert mx-6 mb-3 mt-0">{remoteError}</div> : null}
 
                 <section className="ui-dpad-wrap">
                   <div className="ui-dpad">
@@ -1770,7 +1926,7 @@ function App() {
                       className="ui-dpad-edge ui-dpad-up"
                       disabled={remoteDisabled}
                       onClick={() => {
-                        handleCommand('up');
+                        sendRemoteCommand('up');
                       }}
                     >
                       <Icon name="up" className="h-7 w-7" />
@@ -1779,7 +1935,7 @@ function App() {
                       className="ui-dpad-edge ui-dpad-down"
                       disabled={remoteDisabled}
                       onClick={() => {
-                        handleCommand('down');
+                        sendRemoteCommand('down');
                       }}
                     >
                       <Icon name="down" className="h-7 w-7" />
@@ -1788,7 +1944,7 @@ function App() {
                       className="ui-dpad-edge ui-dpad-left"
                       disabled={remoteDisabled}
                       onClick={() => {
-                        handleCommand('left');
+                        sendRemoteCommand('left');
                       }}
                     >
                       <Icon name="left" className="h-7 w-7" />
@@ -1797,7 +1953,7 @@ function App() {
                       className="ui-dpad-edge ui-dpad-right"
                       disabled={remoteDisabled}
                       onClick={() => {
-                        handleCommand('right');
+                        sendRemoteCommand('right');
                       }}
                     >
                       <Icon name="right" className="h-7 w-7" />
@@ -1806,7 +1962,7 @@ function App() {
                       className="ui-dpad-center"
                       disabled={remoteDisabled}
                       onClick={() => {
-                        handleCommand('select');
+                        sendRemoteCommand('select');
                       }}
                     >
                       Select
@@ -1829,7 +1985,7 @@ function App() {
                       className="ui-nav-item"
                       disabled={remoteDisabled}
                       onClick={() => {
-                        handleCommand('back');
+                        sendRemoteCommand('back');
                       }}
                     >
                       <span className="ui-nav-button">
@@ -1841,7 +1997,7 @@ function App() {
                       className="ui-nav-item"
                       disabled={remoteDisabled}
                       onClick={() => {
-                        handleCommand('home');
+                        sendRemoteCommand('home');
                       }}
                     >
                       <span className="ui-nav-button ui-nav-button-active">
@@ -1909,7 +2065,7 @@ function App() {
                         className="ui-media-button ui-media-button-block"
                         disabled={remoteDisabled}
                         onClick={() => {
-                          handleCommand('volume_up');
+                          sendRemoteCommand('volume_up');
                         }}
                       >
                         <Icon name="plus" className="h-5 w-5" />
@@ -1922,7 +2078,7 @@ function App() {
                         className="ui-media-button ui-media-button-block"
                         disabled={remoteDisabled}
                         onClick={() => {
-                          handleCommand('volume_down');
+                          sendRemoteCommand('volume_down');
                         }}
                       >
                         <Icon name="minus" className="h-5 w-5" />
@@ -1934,7 +2090,7 @@ function App() {
                         className="ui-media-button ui-media-primary"
                         disabled={remoteDisabled}
                         onClick={() => {
-                          handleCommand('play_pause');
+                          sendRemoteCommand('play_pause');
                         }}
                       >
                         <Icon name="play" className="h-8 w-8" />
@@ -1960,7 +2116,7 @@ function App() {
                           className="ui-media-button ui-media-danger"
                           disabled={remoteDisabled}
                           onClick={() => {
-                            handleCommand('power');
+                            sendRemoteCommand('power');
                           }}
                         >
                           <Icon name="power" className="h-5 w-5" />

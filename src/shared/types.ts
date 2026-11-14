@@ -190,6 +190,14 @@ export interface UpdaterStatus {
   rollbackAvailable?: boolean;
   rollbackVersion?: string;
   rollbackCreatedAt?: string;
+  /**
+   * True once an update or rollback has replaced the app bundle on disk. The
+   * running process is still the previous version, so no further check or
+   * install runs until GTV Remote relaunches.
+   */
+  relaunchRequired?: boolean;
+  /** Version now installed on disk and waiting for a relaunch. */
+  installedVersion?: string;
   message: string;
 }
 

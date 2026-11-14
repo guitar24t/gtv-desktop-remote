@@ -361,6 +361,43 @@ describe('launch and shortcut preferences', () => {
     });
   });
 
+  it('does not overwrite an unreadable preferences file during startup readback', async () => {
+    const environment = setup();
+    environment.externalLogin(true);
+    await writeFile(environment.file, '{"shortcut": "Control+Shift+R", truncated');
+    const controller = environment.create();
+    await controller.initialize();
+    expect(controller.getState().shortcutError).toMatch(/could not be read/);
+    expect(controller.getState().launchAtLogin).toBe(true);
+    expect(await readFile(environment.file, 'utf8')).toBe(
+      '{"shortcut": "Control+Shift+R", truncated'
+    );
+    await controller.refresh();
+    expect(await readFile(environment.file, 'utf8')).toBe(
+      '{"shortcut": "Control+Shift+R", truncated'
+    );
+    // An explicit save is the documented repair path.
+    expect((await controller.change({ shortcut: 'Control+Shift+R' })).error).toBeNull();
+    expect(JSON.parse(await readFile(environment.file, 'utf8'))).toEqual({
+      shortcut: 'Control+Shift+R',
+      launchAtLogin: true,
+    });
+  });
+
+  it('does not rewrite preferences on startup when disk already matches the OS login state', async () => {
+    const environment = setup();
+    environment.externalLogin(true);
+    const saved = '{"shortcut":"Control+Shift+R","launchAtLogin":true}';
+    await writeFile(environment.file, saved);
+    const controller = environment.create();
+    await controller.initialize();
+    expect(controller.getState()).toMatchObject({
+      activeShortcut: 'Control+Shift+R',
+      launchAtLogin: true,
+    });
+    expect(await readFile(environment.file, 'utf8')).toBe(saved);
+  });
+
   it('serializes concurrent changes so the final saved preferences contain both updates', async () => {
     const environment = setup();
     const controller = environment.create();

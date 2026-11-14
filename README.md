@@ -7,22 +7,22 @@
   Discover, pair once, and control your TV from your Mac — with keyboard support.</p>
 
   <p>
-    <a href="https://github.com/usrivastava92/gtv-desktop-remote/actions/workflows/ci.yml">
-      <img src="https://github.com/usrivastava92/gtv-desktop-remote/actions/workflows/ci.yml/badge.svg" alt="CI" />
+    <a href="https://github.com/guitar24t/gtv-desktop-remote/actions/workflows/ci.yml">
+      <img src="https://github.com/guitar24t/gtv-desktop-remote/actions/workflows/ci.yml/badge.svg" alt="CI" />
     </a>
-    <a href="https://github.com/usrivastava92/gtv-desktop-remote/releases/latest">
-      <img src="https://img.shields.io/github/v/release/usrivastava92/gtv-desktop-remote?label=release" alt="Latest Release" />
+    <a href="https://github.com/guitar24t/gtv-desktop-remote/releases/latest">
+      <img src="https://img.shields.io/github/v/release/guitar24t/gtv-desktop-remote?label=release" alt="Latest Release" />
     </a>
-    <a href="https://github.com/usrivastava92/gtv-desktop-remote/releases/latest">
-      <img src="https://img.shields.io/github/downloads/usrivastava92/gtv-desktop-remote/total?label=downloads" alt="Total Downloads" />
+    <a href="https://github.com/guitar24t/gtv-desktop-remote/releases/latest">
+      <img src="https://img.shields.io/github/downloads/guitar24t/gtv-desktop-remote/total?label=downloads" alt="Total Downloads" />
     </a>
     <img src="https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple" alt="macOS" />
     <img src="https://img.shields.io/badge/built%20with-Electron-47848F?logo=electron" alt="Electron" />
     <a href="LICENSE">
-      <img src="https://img.shields.io/github/license/usrivastava92/gtv-desktop-remote" alt="License" />
+      <img src="https://img.shields.io/github/license/guitar24t/gtv-desktop-remote" alt="License" />
     </a>
-    <a href="https://scorecard.dev/status/github.com/usrivastava92/gtv-desktop-remote">
-      <img src="https://api.scorecard.dev/projects/github.com/usrivastava92/gtv-desktop-remote/badge" alt="OpenSSF Scorecard" />
+    <a href="https://scorecard.dev/status/github.com/guitar24t/gtv-desktop-remote">
+      <img src="https://api.scorecard.dev/projects/github.com/guitar24t/gtv-desktop-remote/badge" alt="OpenSSF Scorecard" />
     </a>
   </p>
 </div>
@@ -67,7 +67,7 @@ GTV Desktop Remote lets you control any Google TV or Android TV device from your
 
 ## Installation
 
-Download the latest `.dmg` from the [Releases](https://github.com/usrivastava92/gtv-desktop-remote/releases/latest) page, open it, and drag the app to your Applications folder.
+This is the [guitar24t/gtv-desktop-remote](https://github.com/guitar24t/gtv-desktop-remote) fork of [usrivastava92/gtv-desktop-remote](https://github.com/usrivastava92/gtv-desktop-remote). Download the latest `.dmg` for your Mac (Apple Silicon or Intel) from this fork's [Releases](https://github.com/guitar24t/gtv-desktop-remote/releases/latest) page, open it, and drag the app to your Applications folder.
 
 If you install from the `.dmg`, macOS may block the app on first launch because it was downloaded from the internet. If that happens:
 
@@ -76,13 +76,13 @@ If you install from the `.dmg`, macOS may block the app on first launch because 
 3. Click **Open Anyway** for GTV Remote.
 4. Confirm the prompt and launch the app again.
 
-Or install with Homebrew:
+This fork does not publish a Homebrew cask. The `usrivastava92/tap` cask installs the **upstream** build, which updates itself from upstream releases rather than this fork.
 
-```bash
-brew install --cask usrivastava92/tap/gtv-desktop-remote
-```
+### Updates
 
-The Homebrew cask removes the quarantine flag automatically during install and prints fallback steps if macOS still blocks launch.
+GTV Remote checks this fork's GitHub Releases for updates (at most every 15 minutes in the background, or from **Check for Updates…** in the menu-bar menu). Before installing, it checks the download's size and SHA-256 digest against the values GitHub publishes, confirms the app inside is GTV Remote at the offered version, and verifies its code signature. It then swaps the new app into place in one step, restoring the current one if anything fails. The version you were running is kept so you can roll back.
+
+After an update installs, relaunch GTV Remote to finish; no further update is offered until you do. In-app updates need the app in a folder you can write to, such as Applications. They won't run from the disk image or from a quarantined download location.
 
 > **Requirement:** macOS. Your TV must have Android TV Remote Service enabled and be on the same local network as your Mac.
 
@@ -128,7 +128,7 @@ When the remote is focused and connected, your keyboard controls the TV directly
 | `-` / `_`              | Volume Down  |
 | `P`                    | Power        |
 
-> `Cmd`, `Ctrl`, and `Option` combinations are ignored so they don't interfere with normal macOS shortcuts.
+> `Cmd`, `Ctrl`, and `Option` combinations are ignored so they don't interfere with normal macOS shortcuts. Holding an arrow or volume key repeats it; holding any other key acts once.
 
 **Global shortcut:** `CmdOrCtrl+Shift+G` by default — show or hide the remote from any app.
 
@@ -138,7 +138,7 @@ Settings replaces the remote or device list while open. Click **Done** or press 
 
 Click the gear at the far right of the device, pairing, or remote header to open **Settings**. Enable or disable **Launch at login** in the installed macOS app; development Electron is never added to Login Items. It is off by default, and macOS **System Settings → General → Login Items** remains authoritative. Opening Settings refreshes the current macOS state, including external changes made while the app is running, without re-enabling a disabled item. If macOS readback fails, the toggle shows an unknown state and an error; reopen Settings to retry.
 
-Click or focus the show/hide shortcut control, then press and release the actual keys and click **Save shortcut**. For example, hold Control and Option and press G on Mac to record **Ctrl+Opt+G** (**Ctrl+Alt+G** on Windows), then release G to finish recording. Meta is displayed as **Cmd** on Mac and **Win** on Windows. Use modifiers plus a letter, digit, or F1–F24; at least one modifier must be other than Shift. Modifier presses preview the combination; unsupported keys explain what is supported. After a supported chord is pressed, the control previews it and asks you to release the keys; recording finishes only when that chord's letter, digit, or function key is released. **Escape** cancels recording without closing Settings; **Tab**, leaving the control, or closing the view also cancels, including while a captured key is still held. While recording, this app temporarily releases its global shortcut so recording that same chord cannot hide the window, then restores it after the captured key is released or recording is cancelled. If another app takes the binding during recording, Settings reports that it could not be restored rather than claiming it is active; the menu bar remains usable. Recorded shortcuts are stored internally in Electron accelerator format, not display labels, and saved across restarts. A failed replacement keeps the previous working shortcut. If the saved shortcut is occupied on startup, Settings shows the problem; the menu bar still opens the remote.
+Click or focus the show/hide shortcut control, then press and release the actual keys and click **Save shortcut**. For example, hold Control and Option and press G on Mac to record **Ctrl+Opt+G** (**Ctrl+Alt+G** on Windows), then release the keys to finish recording. Meta is displayed as **Cmd** on Mac and **Win** on Windows. Use modifiers plus a letter, digit, or F1–F24; at least one modifier must be other than Shift. Modifier presses preview the combination; unsupported keys explain what is supported. After a supported chord is pressed, the control previews it and asks you to release the keys; recording finishes when you release that chord's letter, digit, or function key, or any of its modifiers (macOS does not report releasing a key pressed while Cmd is held, so releasing Cmd finishes a Cmd chord). **Escape** cancels recording without closing Settings; **Tab**, leaving the control, or closing the view also cancels, including while a captured key is still held. While recording, this app temporarily releases its global shortcut so recording that same chord cannot hide the window, then restores it after recording finishes or is cancelled. If another app takes the binding during recording, Settings reports that it could not be restored rather than claiming it is active; the menu bar remains usable. Recorded shortcuts are stored internally in Electron accelerator format, not display labels, and saved across restarts. A failed replacement keeps the previous working shortcut. If the saved shortcut is occupied on startup, Settings shows the problem; the menu bar still opens the remote.
 
 ---
 

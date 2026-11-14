@@ -1,4 +1,9 @@
+import type { NodeTlsTransport } from '@librecontrol/google-tv' with {
+  'resolution-mode': 'import',
+};
+
 import { createNodeFileSystem, type IFileSystem } from '../../backend/core/fileSystem';
+import type { ILogger } from '../../backend/core/logger';
 import { AndroidTvCertStore } from '../../backend/devices/credentials/androidTvCertStore';
 import { createPairingClient } from '../../backend/pairing/createPairingClient';
 import type { CommandDispatchRequest } from '../../shared/types';
@@ -8,12 +13,15 @@ import { createNodeLogger, getAppDataPath, logError } from '../logger';
 import { commandMetricsStore } from '../metrics';
 
 import {
+  CertificateRejectedError,
   DEFAULT_PAIRING_PORT,
   SERVICE_NAME,
-  isCertificateRejectedError,
+  STALE_CONNECTION_MS,
+  ServerIdentityMismatchError,
   normalizeRemoteError,
   toError,
   type DeviceSession,
+  type DeviceTarget,
   type RemoteClientPort,
   type RemoteState,
 } from './androidTvRemote.types';
@@ -54,17 +62,32 @@ type LibretvRemoteMessage =
       type: 'voice';
       phase: 'begin' | 'payload' | 'end';
       sessionId: number;
+    }
+  | {
+      // The library answers pings itself and still emits them.
+      type: 'ping';
+      sequence: number;
+    }
+  | {
+      type: 'set-active' | 'key' | 'unknown';
     };
 
 interface LibretvGoogleModule {
-  RemoteClient: new (options: {
+  NodeTlsTransport: new (options: {
     cert: string;
     host: string;
     key: string;
     port: number;
     rejectUnauthorized: boolean;
-  }) => LibretvRemoteClientInstance;
+  }) => NodeTlsTransport;
+  RemoteClient: new (options: { transport: NodeTlsTransport }) => LibretvRemoteClientInstance;
 }
+
+/**
+ * Checks the TV's server-certificate fingerprint after the TLS handshake.
+ * Throws to abort the connection.
+ */
+type ServerVerifier = (fingerprint256: string | undefined) => Promise<void>;
 
 const COMMAND_TO_LIBRETV_KEY: Record<CommandDispatchRequest['command'], string> = {
   up: 'up',
@@ -104,7 +127,8 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
 
   constructor(
     private readonly host: string,
-    private readonly certs: PemPair
+    private readonly certs: PemPair,
+    private readonly verifyServer: ServerVerifier
   ) {}
 
   get snapshot(): RemoteState {
@@ -113,6 +137,11 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
 
   get isConnected(): boolean {
     return Boolean(this.client && this.protocolReady);
+  }
+
+  isStale(now = Date.now()): boolean {
+    const lastPingAt = this.state.lastPingAt;
+    return this.isConnected && lastPingAt !== undefined && now - lastPingAt > STALE_CONNECTION_MS;
   }
 
   async connect(commandId?: string): Promise<void> {
@@ -146,7 +175,7 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
     this.protocolReady = false;
     this.clearVoiceSession();
     if (client) {
-      void client.close();
+      closeQuietly(client);
     }
     commandMetricsStore.recordSocketClosed(this.host);
   }
@@ -218,39 +247,57 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
   private async open(commandId?: string): Promise<void> {
     if (integrationEnvironment) assertLoopbackHost(this.host);
     const generation = this.connectionGeneration;
-    const { RemoteClient } = await loadLibretvGoogle();
+    const { NodeTlsTransport, RemoteClient } = await loadLibretvGoogle();
     if (generation !== this.connectionGeneration) {
       throw new Error('Connection has been lost.');
     }
-    const client = new RemoteClient({
+    // TV certificates are self-signed, so chain validation is off; the server
+    // identity is instead pinned (trust on first use) after the handshake.
+    const transport = new NodeTlsTransport({
       cert: this.certs.cert,
       host: this.host,
       key: this.certs.key,
       port: integrationEnvironment?.remotePort ?? 6466,
       rejectUnauthorized: false,
     });
+    const client = new RemoteClient({ transport });
     this.client = client;
+    // Ping freshness is per connection.
+    this.state.lastPingAt = undefined;
     client.on('message', (message) => {
       if (this.client !== client) {
         return;
       }
       commandMetricsStore.recordInboundMessage(this.host);
-      this.state.lastActivityAt = Date.now();
-      if (message.type === 'configure') {
-        this.state.deviceInfo = {
-          appVersion: message.appVersion,
-          model: message.deviceModel,
-          vendor: message.vendor,
-        };
-      } else if (message.type === 'text') {
-        this.state.imeCounter = message.imeCounter;
-        this.state.imeFieldCounter = message.fieldCounter;
-      } else if (message.type === 'ready') {
-        this.state.isOn = message.started;
-      } else if (message.phase === 'begin') {
-        this.state.voiceSessionId = message.sessionId;
-      } else if (message.phase === 'end' && this.state.voiceSessionId === message.sessionId) {
-        this.clearVoiceSession();
+      const now = Date.now();
+      this.state.lastActivityAt = now;
+      switch (message.type) {
+        case 'configure':
+          this.state.deviceInfo = {
+            appVersion: message.appVersion,
+            model: message.deviceModel,
+            vendor: message.vendor,
+          };
+          break;
+        case 'text':
+          this.state.imeCounter = message.imeCounter;
+          this.state.imeFieldCounter = message.fieldCounter;
+          break;
+        case 'ready':
+          this.state.isOn = message.started;
+          break;
+        case 'ping':
+          this.state.lastPingAt = now;
+          break;
+        case 'voice':
+          if (message.phase === 'begin') {
+            this.state.voiceSessionId = message.sessionId;
+          } else if (message.phase === 'end' && this.state.voiceSessionId === message.sessionId) {
+            this.clearVoiceSession();
+          }
+          break;
+        default:
+          break;
       }
     });
     client.on('close', () => {
@@ -273,6 +320,10 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
       if (this.client !== client || generation !== this.connectionGeneration) {
         throw new Error('Connection has been lost.');
       }
+      await this.verifyServer(transport.getCertificates().peer?.fingerprint256);
+      if (this.client !== client || generation !== this.connectionGeneration) {
+        throw new Error('Connection has been lost.');
+      }
       this.protocolReady = true;
       this.state.lastActivityAt = Date.now();
       if (commandId) {
@@ -284,6 +335,9 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
         this.protocolReady = false;
         this.clearVoiceSession();
       }
+      // A failed handshake, readiness timeout or pin mismatch must not leave
+      // the TLS socket open.
+      closeQuietly(client);
       if (commandId) {
         commandMetricsStore.recordConnectFailed(
           this.host,
@@ -303,9 +357,35 @@ class LibretvGoogleRemoteClient implements RemoteClientPort {
   }
 }
 
+function closeQuietly(client: { close(): Promise<void> }): void {
+  try {
+    client.close().catch((error: unknown) => {
+      void logError('androidtvremote', 'Closing the remote client failed', error);
+    });
+  } catch (error) {
+    void logError('androidtvremote', 'Closing the remote client failed', error);
+  }
+}
+
+interface BridgeSession extends DeviceSession {
+  readonly deviceId: string;
+  /** Where the TV currently is; the remote client is bound to this host. */
+  host: string;
+}
+
+/**
+ * Owns the per-device Android TV Remote v2 state: client certificates,
+ * pairing sessions (port 6467) and remote connections (port 6466).
+ *
+ * Everything is keyed by the saved device's `id`, never by IP address, so a
+ * TV that changes address keeps its credentials and two TVs that have shared
+ * an address never share or destroy each other's credentials.
+ */
 export class AndroidTvRemoteBridge {
-  private readonly sessions = new Map<string, DeviceSession & { certKey: string }>();
+  private readonly sessions = new Map<string, BridgeSession>();
+  private readonly pendingSessions = new Map<string, Promise<BridgeSession>>();
   private readonly fs: IFileSystem = createNodeFileSystem();
+  private readonly logger: ILogger = createNodeLogger();
 
   private readonly certStore = new AndroidTvCertStore(
     this.fs,
@@ -313,187 +393,312 @@ export class AndroidTvRemoteBridge {
       getCertStateDir: () => getAppDataPath('androidtvremote'),
       getAppDataPath: (...segments) => getAppDataPath(...segments),
     },
-    createNodeLogger()
+    this.logger
   );
 
-  private getFilesForCertKey(certKey: string): { certPath: string; keyPath: string } {
-    return this.certStore.getFilesForCertKey(certKey);
-  }
-
-  /** @deprecated Use getFilesForCertKey with a macAddress-based key */
-  private getFilesForHost(host: string): { certPath: string; keyPath: string } {
-    return this.getFilesForCertKey(host);
-  }
-
-  /**
-   * Move persisted certs from one identity key to another.
-   * Safe to call even if the old file doesn't exist.
-   */
-  async migratePersistedCerts(oldCertKey: string, newCertKey: string): Promise<void> {
-    await this.certStore.migrate(oldCertKey, newCertKey);
-    for (const session of this.sessions.values()) {
-      if (session.certKey === oldCertKey) session.certKey = newCertKey;
+  private async getSession(target: DeviceTarget): Promise<BridgeSession> {
+    const deviceId = target.deviceId.trim();
+    const host = target.host.trim();
+    if (integrationEnvironment) assertLoopbackHost(host);
+    if (!deviceId) {
+      throw new Error('Missing device id');
     }
-  }
-
-  /**
-   * Migrate certs from old IP-based filename to MAC-based filename.
-   * Safe to call even if the old file doesn't exist.
-   */
-  async migrateCerts(oldHost: string, macAddress: string): Promise<void> {
-    await this.migratePersistedCerts(oldHost, macAddress);
-  }
-
-  private async loadOrCreateCerts(certKey: string): Promise<PemPair> {
-    return this.certStore.loadOrCreate(certKey);
-  }
-
-  private async clearPersistedHostState(certKey: string): Promise<void> {
-    await this.certStore.clear(certKey);
-  }
-
-  private async clearHostSession(
-    host: string,
-    removeCerts = false,
-    certKey?: string
-  ): Promise<void> {
-    const normalizedHost = host.trim();
-    const session = this.sessions.get(normalizedHost);
-
-    session?.remoteClient?.disconnect();
-    await session?.pairingManager?.close();
-    this.sessions.delete(normalizedHost);
-
-    if (removeCerts) {
-      await this.clearPersistedHostState(certKey ?? normalizedHost);
-    }
-  }
-
-  /** Forget this device's authorization without affecting other paired devices. */
-  async forgetDevice(host: string, certKey?: string): Promise<void> {
-    const normalizedHost = host.trim();
-    const identityKey = certKey?.trim() ?? normalizedHost;
-    const hosts = new Set([normalizedHost]);
-    for (const [sessionHost, session] of this.sessions) {
-      if (session.certKey === identityKey) hosts.add(sessionHost);
-    }
-
-    // Closing each client invalidates queued voice work before credentials are removed.
-    for (const sessionHost of hosts) {
-      await this.clearHostSession(sessionHost);
-    }
-    await this.clearPersistedHostState(identityKey);
-    for (const sessionHost of hosts) {
-      if (sessionHost !== identityKey) await this.clearPersistedHostState(sessionHost);
-    }
-  }
-
-  private async getSession(host: string, certKey?: string): Promise<DeviceSession> {
-    const normalizedHost = host.trim();
-    if (integrationEnvironment) assertLoopbackHost(normalizedHost);
-    if (!normalizedHost) {
+    if (!host) {
       throw new Error('Missing host');
     }
 
-    const normalizedCertKey = certKey?.trim();
-    if (normalizedCertKey && normalizedCertKey !== normalizedHost) {
-      await this.migrateCerts(normalizedHost, normalizedCertKey);
+    let session = this.sessions.get(deviceId);
+    if (!session) {
+      let pending = this.pendingSessions.get(deviceId);
+      if (!pending) {
+        pending = this.certStore
+          .loadOrCreate(deviceId, target.legacyCertKeys ?? [])
+          .then((certs) => {
+            const created: BridgeSession = { deviceId, host, certs };
+            this.sessions.set(deviceId, created);
+            return created;
+          })
+          .finally(() => {
+            this.pendingSessions.delete(deviceId);
+          });
+        this.pendingSessions.set(deviceId, pending);
+      }
+      session = await pending;
     }
 
-    const existing = this.sessions.get(normalizedHost);
-    if (existing) {
-      return existing;
-    }
-
-    const session = {
-      certKey: normalizedCertKey ?? normalizedHost,
-      certs: await this.loadOrCreateCerts(normalizedCertKey ?? normalizedHost),
-    };
-    this.sessions.set(normalizedHost, session);
+    this.applyHost(session, host);
     return session;
   }
 
-  async startPairing(host: string, certKey?: string): Promise<Record<string, unknown> | undefined> {
-    record({ layer: 'pairing', direction: 'call', event: 'startPairing', meta: { host, certKey } });
-    const session = await this.getSession(host, certKey);
+  /** Re-targets a session; a remote client bound to the old host is dropped. */
+  private applyHost(session: BridgeSession, host: string): void {
+    if (session.host === host) {
+      return;
+    }
+    record({
+      layer: 'transport',
+      direction: 'call',
+      event: 'hostChanged',
+      meta: { deviceId: session.deviceId, oldHost: session.host, newHost: host },
+    });
+    this.logger.info('androidtvremote', 'Device host changed; dropping stale remote client', {
+      deviceId: session.deviceId,
+      oldHost: session.host,
+      newHost: host,
+    });
+    session.remoteClient?.disconnect();
+    session.remoteClient = undefined;
+    session.host = host;
+  }
+
+  private createRemoteClient(session: BridgeSession): RemoteClientPort {
+    const { deviceId, host } = session;
+    return new LibretvGoogleRemoteClient(host, session.certs, (fingerprint256) =>
+      this.verifyServerIdentity(deviceId, host, fingerprint256)
+    );
+  }
+
+  /** Trust-on-first-use pinning of the TV's remote-service certificate. */
+  private async verifyServerIdentity(
+    deviceId: string,
+    host: string,
+    fingerprint256: string | undefined
+  ): Promise<void> {
+    if (!fingerprint256) {
+      this.logger.warn('androidtvremote', 'TV presented no certificate; skipping server pin', {
+        deviceId,
+        host,
+      });
+      return;
+    }
+
+    const pinned = await this.certStore.readPin(deviceId);
+    if (!pinned) {
+      try {
+        await this.certStore.writePin(deviceId, fingerprint256);
+        this.logger.info('androidtvremote', 'Pinned TV certificate', { deviceId, host });
+      } catch (error) {
+        // Failing to persist only defers pinning to the next connection.
+        this.logger.error('androidtvremote', 'Could not persist TV certificate pin', {
+          deviceId,
+          host,
+          error: String(error),
+        });
+      }
+      return;
+    }
+
+    if (pinned !== fingerprint256) {
+      this.logger.warn('androidtvremote', 'TV certificate does not match the pinned TV', {
+        deviceId,
+        host,
+      });
+      throw new ServerIdentityMismatchError(host);
+    }
+  }
+
+  private ensureRemoteClient(session: BridgeSession): RemoteClientPort {
+    session.remoteClient ??= this.createRemoteClient(session);
+    return session.remoteClient;
+  }
+
+  /**
+   * Returns a connected client, replacing a connection that has stopped
+   * receiving TV pings (half-open after sleep/wake or a network change).
+   */
+  private async ensureConnected(
+    session: BridgeSession,
+    commandId?: string
+  ): Promise<RemoteClientPort> {
+    let client = this.ensureRemoteClient(session);
+    if (client.isStale()) {
+      this.logger.info('androidtvremote', 'No TV ping recently; reconnecting', {
+        deviceId: session.deviceId,
+        host: session.host,
+        lastPingAt: client.snapshot.lastPingAt,
+      });
+      client.disconnect();
+      session.remoteClient = undefined;
+      client = this.ensureRemoteClient(session);
+    }
+    await client.connect(commandId);
+    return client;
+  }
+
+  /**
+   * Normalizes a remote failure. A certificate rejection or server-identity
+   * mismatch drops the client so nothing reuses it; credentials are kept.
+   */
+  private remoteFailure(
+    session: BridgeSession,
+    client: RemoteClientPort | undefined,
+    error: unknown,
+    fallback: string
+  ): Error {
+    const normalized = normalizeRemoteError(error, fallback);
+    if (
+      normalized instanceof CertificateRejectedError ||
+      normalized instanceof ServerIdentityMismatchError
+    ) {
+      if (client) {
+        client.disconnect();
+        if (session.remoteClient === client) {
+          session.remoteClient = undefined;
+        }
+      }
+    }
+    return normalized;
+  }
+
+  /** Closes a session's connections and forgets it (credentials stay on disk). */
+  private async closeSession(deviceId: string, options: { ignoreCloseErrors: boolean }) {
+    const session = this.sessions.get(deviceId);
+    if (!session) {
+      return;
+    }
+    session.remoteClient?.disconnect();
+    session.remoteClient = undefined;
+    const pairingManager = session.pairingManager;
+    session.pairingManager = undefined;
+    session.pairingReady = undefined;
+    this.sessions.delete(deviceId);
+    if (pairingManager) {
+      if (options.ignoreCloseErrors) {
+        await pairingManager.close().catch(() => undefined);
+      } else {
+        await pairingManager.close();
+      }
+    }
+  }
+
+  /**
+   * Forget this device's authorization without affecting other paired
+   * devices: closes its session and deletes its id-keyed certificate, key and
+   * server pin, plus the given legacy (MAC/host-keyed) files. The caller must
+   * only pass legacy keys no other saved device shares.
+   */
+  async forgetDevice(deviceId: string, legacyCertKeys: readonly string[] = []): Promise<void> {
+    const id = deviceId.trim();
+    await this.pendingSessions.get(id)?.catch(() => undefined);
+    // Closing each client invalidates queued voice work before credentials are removed.
+    await this.closeSession(id, { ignoreCloseErrors: false });
+    await this.certStore.clear(id);
+    for (const legacyCertKey of legacyCertKeys) {
+      if (legacyCertKey.trim() && legacyCertKey.trim() !== id) {
+        await this.certStore.clear(legacyCertKey.trim());
+      }
+    }
+  }
+
+  async startPairing(target: DeviceTarget): Promise<Record<string, unknown> | undefined> {
+    record({
+      layer: 'pairing',
+      direction: 'call',
+      event: 'startPairing',
+      meta: { deviceId: target.deviceId, host: target.host },
+    });
+    const session = await this.getSession(target);
 
     if (session.pairingReady) {
       await session.pairingReady;
       return {};
     }
 
-    const pairingManager = await createPairingClient(
-      {
-        cert: session.certs.cert,
-        clientName: SERVICE_NAME,
-        host,
-        key: session.certs.key,
-        port: integrationEnvironment?.pairingPort ?? DEFAULT_PAIRING_PORT,
-        rejectUnauthorized: false,
-      },
-      (error) => {
-        void logError('androidtvremote', 'LibreControl Google TV pairing transport error', error);
+    const host = session.host;
+    const pairingReady = (async () => {
+      // A previous, unfinished pairing still holds a TLS connection to 6467.
+      const previous = session.pairingManager;
+      session.pairingManager = undefined;
+      if (previous) {
+        await previous.close().catch(() => undefined);
       }
-    );
 
-    session.pairingManager = pairingManager;
-    session.pairingReady = pairingManager
-      .start()
-      .then(() => undefined)
-      .catch(async (error: unknown) => {
-        await pairingManager.close();
-        session.pairingManager = undefined;
+      const pairingManager = await createPairingClient(
+        {
+          cert: session.certs.cert,
+          clientName: SERVICE_NAME,
+          host,
+          key: session.certs.key,
+          port: integrationEnvironment?.pairingPort ?? DEFAULT_PAIRING_PORT,
+          rejectUnauthorized: false,
+        },
+        (error) => {
+          void logError('androidtvremote', 'LibreControl Google TV pairing transport error', error);
+        }
+      );
+      session.pairingManager = pairingManager;
+
+      try {
+        await pairingManager.start();
+      } catch (error) {
+        await pairingManager.close().catch(() => undefined);
+        if (session.pairingManager === pairingManager) {
+          session.pairingManager = undefined;
+        }
         throw toError(error, 'Pairing failed.');
-      })
-      .finally(() => {
+      }
+    })().finally(() => {
+      if (session.pairingReady === pairingReady) {
         session.pairingReady = undefined;
-      });
+      }
+    });
+    session.pairingReady = pairingReady;
 
-    await session.pairingReady;
+    await pairingReady;
     return {};
   }
 
-  async finishPairing(host: string, code: string, certKey?: string): Promise<void> {
+  async finishPairing(target: DeviceTarget, code: string): Promise<void> {
     record({
       layer: 'pairing',
       direction: 'call',
       event: 'finishPairing',
-      meta: { host, certKey, codeLength: code.length },
+      meta: { deviceId: target.deviceId, host: target.host, codeLength: code.length },
     });
-    const session = await this.getSession(host, certKey);
-    if (!session.pairingManager) {
+    const session = await this.getSession(target);
+    const pairingManager = session.pairingManager;
+    if (!pairingManager) {
       throw new Error('No pairing session is active for this device.');
     }
 
     try {
-      const result = await session.pairingManager.submitCode(code.trim());
+      const result = await pairingManager.submitCode(code.trim());
       if (result.type !== 'secret-ack' || result.status !== 'ok') {
         throw new Error('Invalid pairing code. Request a new code and try again.');
       }
-      await session.pairingManager.close();
-      session.pairingManager = undefined;
     } catch (error) {
-      await this.clearHostSession(host);
+      // closeSession closes the pairing manager and drops the cached session.
+      await this.closeSession(session.deviceId, { ignoreCloseErrors: true });
       throw normalizeRemoteError(error, 'Pairing failed.');
     }
+
+    if (session.pairingManager === pairingManager) {
+      session.pairingManager = undefined;
+    }
+    await pairingManager.close().catch(() => undefined);
+
+    // The TV may have been reset; re-pin its certificate on the next connect.
+    await this.certStore.clearPin(session.deviceId);
   }
 
-  async connect(host: string, certKey?: string): Promise<Record<string, unknown> | undefined> {
-    record({ layer: 'transport', direction: 'call', event: 'connect', meta: { host, certKey } });
-    const session = await this.getSession(host, certKey);
-    session.remoteClient ??= new LibretvGoogleRemoteClient(host, session.certs);
+  async connect(target: DeviceTarget): Promise<Record<string, unknown> | undefined> {
+    record({
+      layer: 'transport',
+      direction: 'call',
+      event: 'connect',
+      meta: { deviceId: target.deviceId, host: target.host },
+    });
+    const session = await this.getSession(target);
+    const host = session.host;
+    const client = this.ensureRemoteClient(session);
 
     try {
-      await session.remoteClient.connect();
+      await client.connect();
     } catch (error) {
-      const normalized = normalizeRemoteError(error, `Could not connect to ${host}.`);
-      if (isCertificateRejectedError(error)) {
-        await this.clearHostSession(host, true, certKey);
-      }
-      throw normalized;
+      throw this.remoteFailure(session, client, error, `Could not connect to ${host}.`);
     }
 
-    const snapshot = session.remoteClient.snapshot;
+    const snapshot = client.snapshot;
 
     return {
       current_app: snapshot.currentApp,
@@ -503,42 +708,70 @@ export class AndroidTvRemoteBridge {
     };
   }
 
-  disconnect(host: string): void {
-    const session = this.sessions.get(host.trim());
+  disconnect(deviceId: string): void {
+    const session = this.sessions.get(deviceId.trim());
     session?.remoteClient?.disconnect();
     if (session) {
       session.remoteClient = undefined;
     }
   }
 
-  async reset(): Promise<void> {
+  /**
+   * Called after a rescan moved a device: a client still bound to the old
+   * address is dropped so the next command connects to `host`.
+   */
+  updateHost(deviceId: string, host: string): void {
+    const session = this.sessions.get(deviceId.trim());
+    const nextHost = host.trim();
+    if (session && nextHost) {
+      if (integrationEnvironment) assertLoopbackHost(nextHost);
+      this.applyHost(session, nextHost);
+    }
+  }
+
+  /**
+   * Drops every remote connection (credentials and pairing sessions stay).
+   * Used after system resume, when sockets are likely half-open.
+   */
+  dropRemoteClients(): void {
     for (const session of this.sessions.values()) {
       session.remoteClient?.disconnect();
       session.remoteClient = undefined;
-      session.pairingManager = undefined;
-      session.pairingReady = undefined;
     }
+  }
 
+  async reset(): Promise<void> {
+    await Promise.allSettled(this.pendingSessions.values());
+    const sessions = [...this.sessions.values()];
     this.sessions.clear();
+    await Promise.all(
+      sessions.map(async (session) => {
+        session.remoteClient?.disconnect();
+        session.remoteClient = undefined;
+        const pairingManager = session.pairingManager;
+        session.pairingManager = undefined;
+        session.pairingReady = undefined;
+        await pairingManager?.close().catch(() => undefined);
+      })
+    );
     await this.fs.rmRecursive(getAppDataPath('androidtvremote'));
   }
 
-  async sendCommand(
-    host: string,
-    request: CommandDispatchRequest,
-    certKey?: string
-  ): Promise<void> {
-    const session = await this.getSession(host, certKey);
-    session.remoteClient ??= new LibretvGoogleRemoteClient(host, session.certs);
+  async sendCommand(target: DeviceTarget, request: CommandDispatchRequest): Promise<void> {
+    const session = await this.getSession(target);
+    const host = session.host;
 
     commandMetricsStore.recordBridgeSendStart(request, host);
 
+    let client: RemoteClientPort | undefined;
     try {
-      await session.remoteClient.connect(request.id);
-      await session.remoteClient.sendCommand(request);
+      client = await this.ensureConnected(session, request.id);
+      await client.sendCommand(request);
       commandMetricsStore.recordCommandSucceeded(request.id);
     } catch (error) {
-      const normalizedError = normalizeRemoteError(
+      const normalizedError = this.remoteFailure(
+        session,
+        client ?? session.remoteClient,
         error,
         `Could not send ${request.command} to ${host}.`
       );
@@ -556,31 +789,48 @@ export class AndroidTvRemoteBridge {
     }
   }
 
-  async sendText(host: string, text: string, certKey?: string): Promise<void> {
-    const session = await this.getSession(host, certKey);
-    session.remoteClient ??= new LibretvGoogleRemoteClient(host, session.certs);
-
-    await session.remoteClient.connect();
-    await session.remoteClient.sendText(text);
+  async sendText(target: DeviceTarget, text: string): Promise<void> {
+    const session = await this.getSession(target);
+    let client: RemoteClientPort | undefined;
+    try {
+      client = await this.ensureConnected(session);
+      await client.sendText(text);
+    } catch (error) {
+      throw this.remoteFailure(
+        session,
+        client ?? session.remoteClient,
+        error,
+        `Could not send text to ${session.host}.`
+      );
+    }
   }
 
-  async startAssistantVoice(host: string, certKey?: string): Promise<number> {
-    record({ layer: 'voice', direction: 'call', event: 'startAssistantVoice', meta: { host } });
-    const session = await this.getSession(host, certKey);
-    session.remoteClient ??= new LibretvGoogleRemoteClient(host, session.certs);
-    await session.remoteClient.connect();
-    return session.remoteClient.startVoiceSession();
+  async startAssistantVoice(target: DeviceTarget): Promise<number> {
+    record({
+      layer: 'voice',
+      direction: 'call',
+      event: 'startAssistantVoice',
+      meta: { deviceId: target.deviceId, host: target.host },
+    });
+    const session = await this.getSession(target);
+    let client: RemoteClientPort | undefined;
+    try {
+      client = await this.ensureConnected(session);
+      return await client.startVoiceSession();
+    } catch (error) {
+      throw this.remoteFailure(
+        session,
+        client ?? session.remoteClient,
+        error,
+        `Could not start voice on ${session.host}.`
+      );
+    }
   }
 
-  async sendAssistantVoiceChunk(
-    host: string,
-    sessionId: number,
-    chunk: Buffer,
-    _certKey?: string
-  ): Promise<void> {
+  async sendAssistantVoiceChunk(deviceId: string, sessionId: number, chunk: Buffer): Promise<void> {
     if (isCaptureEnabled()) {
       recordBuffer('voice', 'tx', 'voiceChunk', chunk, {
-        host,
+        deviceId,
         sessionId,
         byteLength: chunk.byteLength,
       });
@@ -588,25 +838,25 @@ export class AndroidTvRemoteBridge {
     if (!chunk.length) {
       return;
     }
-    const remoteClient = this.sessions.get(host.trim())?.remoteClient;
+    const remoteClient = this.sessions.get(deviceId.trim())?.remoteClient;
     if (!remoteClient) {
       throw new Error('Connection has been lost.');
     }
     await remoteClient.sendVoiceChunk(sessionId, chunk);
   }
 
-  async stopAssistantVoice(host: string, sessionId: number, _certKey?: string): Promise<void> {
+  async stopAssistantVoice(deviceId: string, sessionId: number): Promise<void> {
     record({
       layer: 'voice',
       direction: 'call',
       event: 'stopAssistantVoice',
-      meta: { host, sessionId },
+      meta: { deviceId, sessionId },
     });
-    await this.sessions.get(host.trim())?.remoteClient?.stopVoiceSession(sessionId);
+    await this.sessions.get(deviceId.trim())?.remoteClient?.stopVoiceSession(sessionId);
   }
 
-  hasPendingAssistantVoiceSession(host: string, _certKey?: string): Promise<boolean> {
-    const remoteClient = this.sessions.get(host.trim())?.remoteClient;
+  hasPendingAssistantVoiceSession(deviceId: string): Promise<boolean> {
+    const remoteClient = this.sessions.get(deviceId.trim())?.remoteClient;
     return Promise.resolve(
       Boolean(remoteClient?.isConnected && remoteClient.snapshot.voiceSessionId !== undefined)
     );

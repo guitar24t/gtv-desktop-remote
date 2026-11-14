@@ -22,6 +22,8 @@ import type { Buffer } from 'node:buffer';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { INVOKE_CHANNELS } from '../shared/ipcContract';
+
 export type CaptureLayer = 'ipc' | 'pairing' | 'remote' | 'transport' | 'voice' | 'discovery';
 export type CaptureDirection = 'tx' | 'rx' | 'call' | 'return';
 
@@ -47,19 +49,35 @@ let captureFilePath = '';
  * Call once at app startup (before any IPC handlers are registered).
  * If GTV_CAPTURE=1 is not set this is a no-op.
  */
-export function initCapture(repoRoot: string): void {
+export function initCapture(outputRoot: string): void {
   if (process.env.GTV_CAPTURE !== '1') return;
 
-  enabled = true;
   seq = 0;
-
-  const capturesDir = path.join(repoRoot, 'captures');
-  fs.mkdirSync(capturesDir, { recursive: true });
-
+  const capturesDir = path.join(outputRoot, 'captures');
   const date = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  captureFilePath = path.join(capturesDir, `capture-${date}.ndjson`);
-
-  captureStream = fs.createWriteStream(captureFilePath, { flags: 'w', encoding: 'utf8' });
+  try {
+    fs.mkdirSync(capturesDir, { recursive: true });
+    captureFilePath = path.join(capturesDir, `capture-${date}.ndjson`);
+    captureStream = fs.createWriteStream(captureFilePath, {
+      flags: 'w',
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    captureStream.on('error', (error) => {
+      // A failing debug capture must never take the app down with it.
+      console.error(`[capture] disabled: ${error.message}`);
+      enabled = false;
+      captureStream = null;
+    });
+  } catch (error) {
+    console.error(
+      `[capture] could not start in ${capturesDir}: ${error instanceof Error ? error.message : String(error)}`
+    );
+    captureFilePath = '';
+    captureStream = null;
+    return;
+  }
+  enabled = true;
 
   record({
     layer: 'ipc',
@@ -133,6 +151,30 @@ export function recordBuffer(
 }
 
 /**
+ * Capture files are meant to be shared as debugging fixtures, so they must not
+ * contain what the user typed to the TV, pairing codes, or raw audio. The first
+ * handler argument (the Electron IPC event) is never recorded.
+ */
+export function redactIpcArguments(channel: string, args: unknown[]): unknown[] {
+  if (channel === INVOKE_CHANNELS.deviceText) {
+    return args.map((value) =>
+      typeof value === 'string' ? `[redacted text, ${String(value.length)} chars]` : '[redacted]'
+    );
+  }
+  if (channel === INVOKE_CHANNELS.devicePair) {
+    return args.map((value) =>
+      value !== null && typeof value === 'object' ? { ...value, code: '[redacted]' } : '[redacted]'
+    );
+  }
+  if (channel === INVOKE_CHANNELS.deviceAssistantVoiceChunk) {
+    return args.map((value) =>
+      typeof value === 'string' ? `[redacted audio, ${String(value.length)} base64 chars]` : value
+    );
+  }
+  return args;
+}
+
+/**
  * Wrap an async IPC handler to capture call + return (with duration + error).
  * Usage: ipcMain.handle(channel, captureIpc(channel, originalHandler))
  *
@@ -140,19 +182,20 @@ export function recordBuffer(
  * boundary (matching Electron's ipcMain.handle signature) while preserving
  * the return type T.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function captureIpc<T>(
   channel: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- handlers keep their own typed parameters
   handler: (...args: any[]) => Promise<T> | T
 ): (...args: unknown[]) => Promise<T> {
   if (!enabled) return handler as (...args: unknown[]) => Promise<T>;
   return async (...args: unknown[]): Promise<T> => {
     const start = Date.now();
+    const payload = redactIpcArguments(channel, args.slice(1));
     record({
       layer: 'ipc',
       direction: 'call',
       event: `ipc:${channel}`,
-      data: args.length > 0 ? args : undefined,
+      data: payload.length > 0 ? payload : undefined,
       meta: { channel },
     });
     try {

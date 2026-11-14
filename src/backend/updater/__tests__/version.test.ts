@@ -70,6 +70,42 @@ describe('compareVersions', () => {
     expect(compareVersions('1.2.3.1', '1.2.3')).toBe(1);
     expect(compareVersions('1.2.3', '1.2.3.1')).toBe(-1);
   });
+
+  it('ranks a release above its own prereleases (semver precedence)', () => {
+    expect(compareVersions('2.3.0-beta.1', '2.3.0')).toBe(-1);
+    expect(compareVersions('2.3.0', '2.3.0-beta.1')).toBe(1);
+    expect(compareVersions('v2.3.0-rc.1', 'v2.3.0')).toBe(-1);
+  });
+
+  it('still ranks a prerelease of a newer core above an older release', () => {
+    expect(compareVersions('2.4.0-alpha', '2.3.9')).toBe(1);
+    expect(compareVersions('2.3.0', '2.4.0-alpha')).toBe(-1);
+  });
+
+  it('orders prerelease identifiers per semver §11', () => {
+    const ordered = [
+      '1.0.0-alpha',
+      '1.0.0-alpha.1',
+      '1.0.0-alpha.beta',
+      '1.0.0-beta',
+      '1.0.0-beta.2',
+      '1.0.0-beta.11',
+      '1.0.0-rc.1',
+      '1.0.0',
+    ];
+    for (let i = 0; i < ordered.length - 1; i += 1) {
+      const lower = ordered[i] ?? '';
+      const higher = ordered[i + 1] ?? '';
+      expect(compareVersions(lower, higher)).toBe(-1);
+      expect(compareVersions(higher, lower)).toBe(1);
+    }
+  });
+
+  it('treats equal prereleases as equal and ignores build metadata', () => {
+    expect(compareVersions('1.0.0-beta.1', '1.0.0-beta.1')).toBe(0);
+    expect(compareVersions('1.0.0+build.5', '1.0.0+build.9')).toBe(0);
+    expect(compareVersions('1.0.0-beta+exp.sha.5114f85', '1.0.0-beta')).toBe(0);
+  });
 });
 
 describe('formatMinutesUntil', () => {

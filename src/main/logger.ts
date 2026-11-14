@@ -7,6 +7,9 @@ import type { ILogger } from '../backend/core/logger';
 
 type LogLevel = 'INFO' | 'WARN' | 'ERROR';
 
+/** Rotate once the active log reaches this size; one previous file is kept. */
+export const MAX_LOG_BYTES = 5 * 1024 * 1024;
+
 function getLogPath(): string {
   return path.join(app.getPath('userData'), 'gtv-remote.log');
 }
@@ -15,7 +18,11 @@ export function getAppDataPath(...segments: string[]): string {
   return path.join(app.getPath('userData'), ...segments);
 }
 
-function serializeErrorDetails(details: unknown): string {
+/**
+ * Serialize arbitrary log details without ever throwing: circular references,
+ * BigInts and throwing getters/toJSON must not turn a log call into a failure.
+ */
+export function serializeErrorDetails(details: unknown): string {
   if (details instanceof Error) {
     return `${details.message}\n${details.stack ?? ''}`.trim();
   }
@@ -24,29 +31,92 @@ function serializeErrorDetails(details: unknown): string {
     return details;
   }
 
-  return JSON.stringify(details);
+  try {
+    const seen = new WeakSet();
+    const serialized = JSON.stringify(details, (_key, value: unknown) => {
+      if (typeof value === 'bigint') return value.toString();
+      if (value instanceof Error) return { message: value.message, stack: value.stack };
+      if (value !== null && typeof value === 'object') {
+        if (seen.has(value)) return '[Circular]';
+        seen.add(value);
+      }
+      return value;
+    }) as string | undefined;
+    return serialized ?? String(details);
+  } catch {
+    try {
+      return String(details);
+    } catch {
+      return '[unserializable details]';
+    }
+  }
 }
 
-async function write(
-  level: LogLevel,
-  scope: string,
-  message: string,
-  details?: unknown
-): Promise<void> {
-  const logPath = getLogPath();
-  const timestamp = new Date().toISOString();
-  const body = details === undefined ? '' : ` ${serializeErrorDetails(details)}`;
-  const line = `[${timestamp}] [${level}] [${scope}] ${message}${body}\n`;
+function writeConsole(level: LogLevel, line: string): void {
+  try {
+    if (level === 'ERROR') {
+      console.error(line);
+    } else {
+      console.log(line);
+    }
+  } catch {
+    // stdout/stderr can be closed (EPIPE) when launched without a terminal.
+  }
+}
 
+let writeChain: Promise<void> = Promise.resolve();
+let lastFailureReportAt = 0;
+
+function reportLoggerFailure(error: unknown): void {
+  // Never route logger failures back through the logger: that is how a full disk
+  // used to become an unbounded unhandledRejection → logError → rejection loop.
+  const now = Date.now();
+  if (now - lastFailureReportAt < 60_000) return;
+  lastFailureReportAt = now;
+  try {
+    console.error(
+      `[logger] Could not write log file: ${error instanceof Error ? error.message : String(error)}`
+    );
+  } catch {
+    // Nothing else can be done.
+  }
+}
+
+async function appendWithRotation(logPath: string, line: string): Promise<void> {
   await fs.mkdir(path.dirname(logPath), { recursive: true });
+  try {
+    const { size } = await fs.stat(logPath);
+    if (size + Buffer.byteLength(line) > MAX_LOG_BYTES) {
+      await fs.rename(logPath, `${logPath}.1`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
   await fs.appendFile(logPath, line, 'utf8');
+}
 
-  if (level === 'ERROR') {
-    console.error(line.trim());
-    return;
+/**
+ * Writes are serialized (ordering, rotation) and the returned promise never
+ * rejects: callers routinely `await logError(...)` inside catch blocks, and a
+ * logging failure must never replace the error they are handling.
+ */
+function write(level: LogLevel, scope: string, message: string, details?: unknown): Promise<void> {
+  let line: string;
+  try {
+    const timestamp = new Date().toISOString();
+    const body = details === undefined ? '' : ` ${serializeErrorDetails(details)}`;
+    line = `[${timestamp}] [${level}] [${scope}] ${message}${body}\n`;
+  } catch {
+    line = `[${level}] [${scope}] ${message}\n`;
   }
 
-  console.log(line.trim());
+  writeConsole(level, line.trim());
+
+  const operation = writeChain
+    .then(() => appendWithRotation(getLogPath(), line))
+    .catch(reportLoggerFailure);
+  writeChain = operation;
+  return operation;
 }
 
 export async function logInfo(scope: string, message: string, details?: unknown): Promise<void> {
@@ -73,12 +143,8 @@ export function getLoggerPath(): string {
  *
  * The wrappers fire-and-forget the underlying `Promise<void>` so the
  * synchronous `ILogger` contract is satisfied without forcing every backend
- * caller to write `void logger.info(...)` (the noisy ceremony that prompted
- * the post-review revision of this PR). This matches the fire-and-forget
- * behaviour every existing inline `logInfo(...)` call site already has —
- * the codebase already doesn't await most of them — so observability is
- * net-zero changed. Behavior for `await logInfo(...)` callers is also
- * unchanged because `logInfo` itself remains async-exported.
+ * caller to write `void logger.info(...)`. The underlying promise never
+ * rejects, so dropping it cannot produce an unhandled rejection.
  *
  * The factory is deliberately stateless — it returns a fresh object each
  * call so multiple composition roots can each hold their own reference

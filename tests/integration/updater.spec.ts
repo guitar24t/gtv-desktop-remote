@@ -1,4 +1,4 @@
-import { readFile, writeFile, rm, access } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { test, expect, repository, type AppHarness } from './app-harness';
@@ -23,6 +23,23 @@ async function installedFiles(bundle: string) {
     readFile(path.join(bundle, 'Contents', 'Info.plist'), 'utf8'),
     readFile(path.join(bundle, 'Contents', 'MacOS', 'GTV Remote'), 'utf8'),
   ]);
+}
+
+/** Hidden staged/aside bundles beside the installed app, plus leftover update work directories. */
+async function leftovers(h: AppHarness) {
+  const hidden = (await readdir(path.join(h.profile, 'installed'))).filter((name) =>
+    name.startsWith('.')
+  );
+  const work = await readdir(path.join(h.profile, 'update-tmp')).catch(() => []);
+  return [...hidden, ...work];
+}
+
+async function nativeOperations(h: AppHarness) {
+  return (
+    JSON.parse(await readFile(path.join(h.profile, 'native-operations.json'), 'utf8')) as {
+      operations: { command: string; args: string[] }[];
+    }
+  ).operations;
 }
 
 async function rollbackFiles(h: AppHarness) {
@@ -91,24 +108,39 @@ test('UPDATE-AVAILABLE-DISMISS: offer dismissal does not alter available release
   });
 });
 
-for (const mode of ['download-failure', 'invalid-archive'] as const) {
+const installFailureDetail = {
+  'download-failure': /503/,
+  'invalid-archive': /unzip|zip|archive/i,
+  'digest-mismatch': /SHA-256 verification/,
+  'missing-digest': /no SHA-256 digest/,
+  'wrong-identifier': /bundle identifier "com\.example\.not-gtv-remote"/,
+} as const;
+
+for (const mode of [
+  'download-failure',
+  'invalid-archive',
+  'digest-mismatch',
+  'missing-digest',
+  'wrong-identifier',
+] as const) {
   test(`UPDATE-INSTALL-FAILURE-${mode}: failure retains installed files and clears busy`, async ({
     harness: h,
   }) => {
     await updates(h, async (server, bundle) => {
       await h.dialogs([0]);
+      server.mode = mode;
       await h.api('checkForUpdates');
       const before = await installedFiles(bundle);
-      server.mode = mode;
       const result = await h.api('installAvailableUpdate');
       expect(result.stage).toBe('failed');
       expect(result.inProgress).toBe(false);
       expect(result.rollbackAvailable).toBe(false);
+      expect(result.relaunchRequired).toBeUndefined();
       expect(await installedFiles(bundle)).toEqual(before);
+      expect(await leftovers(h)).toEqual([]);
       await expectDialogsConsumed(h, [['OK']]);
-      expect((await dialogState(h)).requests.at(-1)?.detail).toMatch(
-        mode === 'download-failure' ? /503/ : /unzip|zip|archive/i
-      );
+      expect((await dialogState(h)).requests.at(-1)?.detail).toMatch(installFailureDetail[mode]);
+      if (mode === 'missing-digest') expect(server.requests).not.toContain('/asset');
       server.mode = 'available';
       await h.dialogs([1]);
       await h.api('checkForUpdates');
@@ -128,12 +160,23 @@ test('UPDATE-INSTALL-ROLLBACK: downloaded ZIP replaces sandbox bundle, saves bac
     await h.api('checkForUpdates');
     const old = await readFile(path.join(bundle, 'Contents', 'Info.plist'), 'utf8');
     const oldFiles = await installedFiles(bundle);
+    // A file the new release no longer ships must not survive the install.
+    const stale = path.join('Contents', 'Resources', 'stale.txt');
+    await mkdir(path.join(bundle, 'Contents', 'Resources'), { recursive: true });
+    await writeFile(path.join(bundle, stale), 'only in 1.6.4');
     const result = await h.api('installAvailableUpdate');
     expect(result.stage).toBe('completed');
     expect(result.rollbackAvailable).toBe(true);
     expect(result.inProgress).toBe(false);
+    expect(result.relaunchRequired).toBe(true);
+    expect(result.installedVersion).toBe('1.6.5');
     await expectDialogsConsumed(h, [['Relaunch now', 'Later']]);
     expect(await rollbackFiles(h)).toEqual(oldFiles);
+    await expect(access(path.join(bundle, stale))).rejects.toThrow();
+    expect(await readFile(path.join(h.profile, 'rollback', 'GTV Remote.app', stale), 'utf8')).toBe(
+      'only in 1.6.4'
+    );
+    expect(await leftovers(h)).toEqual([]);
     expect(await readFile(path.join(bundle, 'Contents', 'Info.plist'), 'utf8')).toContain('1.6.5');
     const state = JSON.parse(await readFile(path.join(h.profile, 'updater-state.json'), 'utf8'));
     const backup = path.join(
@@ -161,7 +204,11 @@ test('UPDATE-INSTALL-ROLLBACK: downloaded ZIP replaces sandbox bundle, saves bac
     expect(restored.rollbackAvailable).toBe(false);
     expect(await readFile(path.join(bundle, 'Contents', 'Info.plist'), 'utf8')).toBe(old);
     expect(restored.inProgress).toBe(false);
+    expect(restored.relaunchRequired).toBe(true);
+    expect(restored.installedVersion).toBe('1.6.4');
     expect(await installedFiles(bundle)).toEqual(oldFiles);
+    expect(await readFile(path.join(bundle, stale), 'utf8')).toBe('only in 1.6.4');
+    expect(await leftovers(h)).toEqual([]);
     await expectDialogsConsumed(h, [
       ['Rollback now', 'Cancel'],
       ['Relaunch now', 'Later'],
@@ -315,7 +362,7 @@ test('UPDATE-PROGRESS: actual event stream reports download bytes, installing an
   });
 });
 
-test('UPDATE-NATIVE-FAILURE: failed quarantine operation preserves backup for real rollback recovery', async ({
+test('UPDATE-NATIVE-FAILURE: failed quarantine removal on the staged copy leaves the installed app untouched', async ({
   harness: h,
 }) => {
   await updates(h, async (_server, bundle) => {
@@ -325,22 +372,48 @@ test('UPDATE-NATIVE-FAILURE: failed quarantine operation preserves backup for re
     await h.dialogs([0]);
     const failed = await h.api('installAvailableUpdate');
     expect(failed.stage).toBe('failed');
-    expect(failed.rollbackAvailable).toBe(true);
+    expect(failed.rollbackAvailable).toBe(false);
     expect(failed.inProgress).toBe(false);
-    expect(await rollbackFiles(h)).toEqual(oldFiles);
-    expect((await installedFiles(bundle)).every((file) => file.includes('1.6.5'))).toBe(true);
+    expect(failed.relaunchRequired).toBeUndefined();
+    // Quarantine is cleared on the verified, staged sibling before the swap, so
+    // a failure there never reaches the installed bundle.
+    expect(await installedFiles(bundle)).toEqual(oldFiles);
+    expect(await leftovers(h)).toEqual([]);
+    const xattr = (await nativeOperations(h)).filter((operation) => operation.command === 'xattr');
+    expect(xattr.at(-1)?.args.at(-1)).toMatch(/[/\\]\.GTV Remote\.app\.update-[^/\\]+$/);
     await expectDialogsConsumed(h, [['OK']]);
     expect((await dialogState(h)).requests.at(-1)?.detail).toContain('Synthetic native failure');
     await rm(path.join(h.profile, 'fail-native-command'));
-    await h.dialogs([0, 1]);
-    expect((await h.api('rollbackToPreviousVersion')).stage).toBe('completed');
-    expect(await readFile(path.join(bundle, 'Contents', 'Info.plist'), 'utf8')).toContain('1.6.4');
-    expect(await installedFiles(bundle)).toEqual(oldFiles);
-    expect((await h.api('getUpdaterStatus')).rollbackAvailable).toBe(false);
-    await expectDialogsConsumed(h, [
-      ['Rollback now', 'Cancel'],
-      ['Relaunch now', 'Later'],
-    ]);
+    await h.dialogs([1]);
+    await h.api('checkForUpdates');
+    expect((await h.api('installAvailableUpdate')).stage).toBe('completed');
+    expect(await rollbackFiles(h)).toEqual(oldFiles);
+    expect((await installedFiles(bundle)).every((file) => file.includes('1.6.5'))).toBe(true);
+    await expectDialogsConsumed(h, [['Relaunch now', 'Later']]);
+  });
+});
+
+test('UPDATE-LATER-PENDING-RELAUNCH: after Later, checks report the relaunch and never reinstall over the backup', async ({
+  harness: h,
+}) => {
+  await updates(h, async (server, bundle) => {
+    await h.dialogs([1]);
+    await h.api('checkForUpdates');
+    const oldFiles = await installedFiles(bundle);
+    expect((await h.api('installAvailableUpdate')).relaunchRequired).toBe(true);
+    await expectDialogsConsumed(h, [['Relaunch now', 'Later']]);
+    const requests = server.requests.length;
+    const manual = await h.api('checkForUpdates');
+    expect(manual.relaunchRequired).toBe(true);
+    expect(manual.installedVersion).toBe('1.6.5');
+    expect(manual.updateInstallable).toBe(false);
+    expect(manual.message).toBe('Update 1.6.5 installed. Relaunch GTV Remote to finish.');
+    expect((await h.api('checkForUpdatesInBackground')).relaunchRequired).toBe(true);
+    expect((await h.api('installAvailableUpdate')).relaunchRequired).toBe(true);
+    expect(server.requests.length).toBe(requests);
+    // The backup still holds the version that was running, not a copy of 1.6.5.
+    expect(await rollbackFiles(h)).toEqual(oldFiles);
+    expect((await dialogState(h)).responses).toEqual([]);
   });
 });
 

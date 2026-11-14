@@ -171,3 +171,63 @@ export function normalizeDraft(
     lastConnectedAt: existing?.lastConnectedAt,
   };
 }
+
+function sameMac(left: string | undefined, right: string | undefined): boolean {
+  const a = left?.trim().toLowerCase();
+  const b = right?.trim().toLowerCase();
+  return Boolean(a && b && a === b);
+}
+
+function otherDeviceSharesHost(device: SavedDevice, savedList: readonly SavedDevice[]): boolean {
+  const host = device.host.trim();
+  return savedList.some((other) => other.id !== device.id && other.host.trim() === host);
+}
+
+function otherDeviceSharesMac(device: SavedDevice, savedList: readonly SavedDevice[]): boolean {
+  return savedList.some(
+    (other) => other.id !== device.id && sameMac(other.macAddress, device.macAddress)
+  );
+}
+
+/**
+ * Legacy credential keys a device may adopt when it has no pair under its
+ * `id` yet, in priority order. Older releases stored the client certificate
+ * under the MAC address when known and under the host otherwise. A host-keyed
+ * pair is only offered when no other saved device has that host, because an
+ * IP address alone cannot tell two TVs apart.
+ */
+export function legacyCertKeysFor(
+  device: SavedDevice,
+  savedList: readonly SavedDevice[]
+): string[] {
+  const keys: string[] = [];
+  const mac = device.macAddress?.trim();
+  if (mac) {
+    keys.push(mac);
+  }
+  const host = device.host.trim();
+  if (host && !otherDeviceSharesHost(device, savedList)) {
+    keys.push(host);
+  }
+  return keys;
+}
+
+/**
+ * Legacy credential keys that may be deleted when `device` is forgotten:
+ * its MAC and host keys, each only when no other saved device shares it.
+ */
+export function forgettableLegacyCertKeys(
+  device: SavedDevice,
+  savedList: readonly SavedDevice[]
+): string[] {
+  const keys: string[] = [];
+  const mac = device.macAddress?.trim();
+  if (mac && !otherDeviceSharesMac(device, savedList)) {
+    keys.push(mac);
+  }
+  const host = device.host.trim();
+  if (host && !otherDeviceSharesHost(device, savedList)) {
+    keys.push(host);
+  }
+  return keys;
+}

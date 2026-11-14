@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { recordedShortcut, shortcutLabel } from '../shortcut';
+import { modifierForKey, recordedShortcut, shortcutLabel } from '../shortcut';
 
 const chord = {
   key: 'g',
@@ -49,5 +49,20 @@ describe('recorded shortcut keys and platform labels', () => {
     expect(
       recordedShortcut({ ...chord, ctrlKey: false, altKey: false, metaKey: true }, false)
     ).toBe('Super+G');
+  });
+});
+
+describe('modifierForKey', () => {
+  it('maps modifier keys to the accelerator names used by recorded shortcuts', () => {
+    expect(modifierForKey('Control')).toBe('Control');
+    expect(modifierForKey('Alt')).toBe('Alt');
+    expect(modifierForKey('Shift')).toBe('Shift');
+    expect(modifierForKey('Meta')).toBe('Super');
+    expect(modifierForKey('OS')).toBe('Super');
+  });
+
+  it('returns null for non-modifier keys', () => {
+    expect(modifierForKey('g')).toBeNull();
+    expect(modifierForKey('Enter')).toBeNull();
   });
 });

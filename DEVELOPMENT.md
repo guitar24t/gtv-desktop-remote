@@ -208,6 +208,15 @@ Releases are produced by the `Release` GitHub Actions workflow
 [Conventional Commits](https://www.conventionalcommits.org/). Packaging is
 handled by `electron-builder`.
 
+This checkout publishes from the `guitar24t/gtv-desktop-remote` fork.
+semantic-release publishes to the repository in `package.json`
+`repository.url`, and the in-app updater reads releases from
+`RELEASE_OWNER`/`RELEASE_REPO` in `src/backend/updater/releaseSource.ts`. A
+unit test fails if those two disagree. Leave `build.appId`
+(`com.utkarsh.gtvdesktopremote`) unchanged: macOS ties microphone and
+login-item permissions to it, and the updater refuses bundles with a different
+`CFBundleIdentifier`.
+
 ### Manual, batched releases
 
 The workflow is **manually triggered** — it no longer fires on every push to
@@ -274,17 +283,21 @@ allow-list and production-environment approval gates.
 - The `CI` workflow validates install, typecheck, lint, format, and build for
   every push and pull request.
 - The `Release` workflow only runs on manual dispatch and is responsible for
-  building the macOS DMG + ZIP, running semantic-release, and updating the
-  Homebrew tap.
+  building the macOS DMG + ZIP, running semantic-release, and (only when the
+  `HOMEBREW_TAP_REPOSITORY` repository variable is set) updating the Homebrew
+  tap.
+- Workflows default to read-only `contents` permissions, and checkouts in
+  jobs that don't push use `persist-credentials: false`. The free-form release
+  `reason` input reaches scripts only through an environment variable.
 
 ### Who can trigger a release
 
 The `Release` workflow is locked down with **two layers**:
 
 1. **Actor allow-list (fast-fail).** The `authorize` job in `release.yml`
-   reads `RELEASE_ALLOWED_ACTORS` and fails the run immediately if the
-   triggering user is not on the list. Update this env var in the workflow
-   file (in a PR you review) to grant or revoke access.
+   reads `RELEASE_ALLOWED_ACTORS` (currently `guitar24t`) and fails the run
+   immediately if the triggering user is not on the list. Update this env var
+   in the workflow file (in a PR you review) to grant or revoke access.
 2. **GitHub Environment approval (hard, GitHub-enforced).** Both jobs declare
    `environment: production`. GitHub will pause the run and require an
    approval from a configured reviewer before any build, publish, or
@@ -304,6 +317,10 @@ In the repo on GitHub:
    - `APP_CLIENT_ID` → **Environment variables** of `production`.
    - `APP_PRIVATE_KEY` → **Environment secrets** of `production`.
 
+   The GitHub App must be installed on this repository. Its token is minted
+   for `${{ github.repository_owner }}`/this repository, so nothing in the
+   workflow names a specific account.
+
    This guarantees the secret is only injected after you click "Approve and
    run", so an unauthorized or accidental dispatch cannot exfiltrate it.
 
@@ -319,41 +336,75 @@ After this setup, the flow for a release is:
 
 ## Homebrew Cask Releases
 
-Homebrew installation is published through a tap repository. The release workflow
-updates `usrivastava92/homebrew-tap` after semantic-release creates a GitHub
-release and uploads the arm64 and x64 macOS DMGs.
+Publishing a Homebrew cask is optional. This fork does not publish one by
+default; the `usrivastava92/tap` cask installs the upstream build.
+
+To publish a cask from this repository:
+
+1. Create a tap repository (for example `guitar24t/homebrew-tap`) with a `main`
+   branch and a `Casks/` folder.
+2. Install the release GitHub App on the tap repository as well.
+3. Set the repository (or `production` environment) variable
+   `HOMEBREW_TAP_REPOSITORY` to `owner/repo`, e.g. `guitar24t/homebrew-tap`.
+
+When `HOMEBREW_TAP_REPOSITORY` is unset, the tap steps are skipped and the run
+summary says so. When it is set, the workflow validates the value, mints an
+App token scoped to that repository, and pushes
+`Casks/gtv-desktop-remote.rb` after semantic-release has created the GitHub
+release and uploaded the arm64 and x64 DMGs.
 
 GitHub download labels identify Apple Silicon (ARM64) or Intel (x64), followed by
 DMG or ZIP. These display labels are configured in `.releaserc.json`; artifact
 filenames retain their `-mac-arm64` or `-mac-x64` suffixes. Homebrew selects the
 download through the cask's `on_arm` and `on_intel` blocks, not GitHub labels.
 
-Required setup:
-
-- Create the tap repository: `usrivastava92/homebrew-tap`.
-- Use repository-scoped GitHub App tokens for the source repo and the tap repo.
-- Store the App client ID in `APP_CLIENT_ID` and the private key in
-  `APP_PRIVATE_KEY`.
-
 The workflow normalizes packaged filenames to the expected `GTV Remote-...`
 pattern and computes each DMG's checksum. It passes both checksums to the Node
 asset resolver as environment variables, matching uploaded assets by digest first
 and architecture-specific filename suffix when a digest match is unavailable.
-It then renders `Casks/gtv-desktop-remote.rb` with separate downloads for Apple
-Silicon and Intel using:
+It then renders the cask with separate downloads for Apple Silicon and Intel
+using the command below. `--repository` defaults to the `package.json`
+repository, and every value is validated before it is written into the Ruby
+file.
 
 ```bash
 yarn homebrew:cask --version 0.8.0 --sha256-arm64 <sha256> --artifact-name-arm64 "GTV Remote-0.8.0-mac-arm64.dmg" --sha256-x64 <sha256> --artifact-name-x64 "GTV Remote-0.8.0-mac-x64.dmg"
 ```
 
-Users can install the published cask with:
+Users can then install the cask with `brew install --cask <owner>/<tap>/gtv-desktop-remote`
+(for `guitar24t/homebrew-tap`, that is `guitar24t/tap/gtv-desktop-remote`).
 
-```bash
-brew install --cask usrivastava92/tap/gtv-desktop-remote
-```
+## In-App Updater
 
-The next legitimate release should verify the GitHub Release, the Homebrew tap
-update, and the App token setup before publishing again.
+`src/main/updater.ts` checks `https://api.github.com/repos/guitar24t/gtv-desktop-remote/releases/latest`
+and picks the ZIP asset for the running architecture. Prerelease versions
+compare per semver (`2.3.0-beta.1` < `2.3.0`).
+
+- **Verification.** Installation is refused unless the asset has a GitHub
+  `digest`. The download is hashed as it streams and must match the published
+  `size` and SHA-256. The extracted bundle's `CFBundleIdentifier` must equal
+  the installed app's, and its `CFBundleShortVersionString` must equal the
+  release version. On macOS, `codesign --verify --deep --strict` must pass;
+  ad-hoc signatures still seal every file. Only then is
+  `com.apple.quarantine` removed.
+- **Swap.** The verified bundle is copied (`ditto`) to a hidden sibling, e.g.
+  `/Applications/.GTV Remote.app.update-<stamp>`. The installed bundle is
+  renamed aside and the staged one is renamed into place. If that fails, the
+  original is renamed back. The bundle that was moved aside becomes the
+  rollback backup in `~/Library/Application Support/GTV Remote/rollback`
+  (moved, or copied across volumes). Rollback uses the same swap. Temporary
+  ZIP/unpack folders and failed stages are always removed.
+- **Before downloading,** the updater stops with "Move GTV Remote to your
+  Applications folder, then try again." if the app is translocated or its
+  bundle or folder is not writable (for example a disk image). The existing
+  rollback backup is not touched.
+- **Relaunch pending.** After an install or rollback, `UpdaterStatus` reports
+  `relaunchRequired: true` and `installedVersion`. Checks and installs return
+  that status without contacting GitHub until the app relaunches.
+- **Concurrency and throttling.** One install or rollback runs at a time.
+  Checks during one return the current status. Background checks run at most
+  every 15 minutes after a completed check, and 5 minutes after a failure (or
+  at the GitHub rate-limit reset, if later).
 
 ## Recommended Developer Flow
 

@@ -2,21 +2,27 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { app, BrowserWindow, globalShortcut, ipcMain, Menu, nativeImage, Tray } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  globalShortcut,
+  ipcMain,
+  Menu,
+  nativeImage,
+  powerMonitor,
+  session,
+  Tray,
+} from 'electron';
 
 import { showOnboardingOnce } from '../backend/app/onboarding';
 import { createNodeFileSystem } from '../backend/core/fileSystem';
 import { PreferencesController } from '../backend/preferences';
 import { INVOKE_CHANNELS } from '../shared/ipcContract';
-import type {
-  CommandDispatchRequest,
-  CommandDropReport,
-  DeviceDraft,
-  PairingRequest,
-  UpdaterStatus,
-} from '../shared/types';
+import type { UpdaterStatus } from '../shared/types';
 
 import { captureIpc, closeCapture, initCapture } from './capture';
+import { stopDiscovery } from './device/discovery';
 import { GoogleTvAdapter } from './device/googleTvAdapter';
 import {
   getLogin,
@@ -27,6 +33,16 @@ import {
   setLogin,
   showMessageBox,
 } from './integrationEnvironment';
+import {
+  requireCommandDropReport,
+  requireCommandRequest,
+  requireDeviceDraft,
+  requireDeviceId,
+  requirePairingRequest,
+  requireTextInput,
+  requireVoiceChunk,
+  requireVoiceSessionId,
+} from './ipcValidation';
 import { getLoggerPath, logError, logInfo } from './logger';
 import { commandMetricsStore } from './metrics';
 import {
@@ -34,14 +50,26 @@ import {
   checkForUpdatesManually,
   getUpdaterStatus,
   installAvailableUpdate,
+  relaunchToFinishUpdate,
   rollbackToPreviousVersion,
   subscribeUpdaterStatus,
 } from './updater';
 
 declare const _MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 
+const DEV_SERVER_ORIGIN = 'http://localhost:5173';
+/** A click on the menu-bar icon arrives just after the blur it caused hid the window. */
+const TRAY_CLICK_AFTER_BLUR_MS = 400;
+
 let tray: Tray | undefined;
 let windowRef: BrowserWindow | undefined;
+let windowCreation: Promise<BrowserWindow> | undefined;
+let lastBlurHideAt = 0;
+let isQuitting = false;
+let markBootstrapped: () => void = () => undefined;
+const bootstrapped = new Promise<void>((resolve) => {
+  markBootstrapped = resolve;
+});
 
 const adapter = new GoogleTvAdapter();
 const appName = 'GTV Remote';
@@ -70,6 +98,74 @@ function getAssetPath(...parts: string[]) {
 
 function getRendererEntryPath() {
   return path.join(app.getAppPath(), 'dist', 'index.html');
+}
+
+function loadsBuiltRenderer(): boolean {
+  return app.isPackaged || Boolean(integrationEnvironment);
+}
+
+/** True only for the app's own renderer document (built file or dev server). */
+function isAppUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    if (loadsBuiltRenderer()) {
+      parsed.hash = '';
+      parsed.search = '';
+      return parsed.href === pathToFileURL(getRendererEntryPath()).href;
+    }
+    return parsed.origin === DEV_SERVER_ORIGIN;
+  } catch {
+    return false;
+  }
+}
+
+function isMainWindowContents(contents: Electron.WebContents | null | undefined): boolean {
+  return Boolean(
+    contents && windowRef && !windowRef.isDestroyed() && contents === windowRef.webContents
+  );
+}
+
+/** Only the remote window's top frame, showing the app's own document, may call the backend. */
+function isTrustedSender(event: Electron.IpcMainInvokeEvent): boolean {
+  if (!isMainWindowContents(event.sender)) return false;
+  const frame = event.senderFrame;
+  return frame !== null && frame === event.sender.mainFrame && isAppUrl(frame.url);
+}
+
+function hardenWebContents(contents: Electron.WebContents) {
+  // The remote never opens windows or leaves its own page. Dropping a file or
+  // link on the window would otherwise load it with the full preload bridge.
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  const blockForeignNavigation = (event: Electron.Event<{ url: string }>) => {
+    if (isAppUrl(event.url)) return;
+    event.preventDefault();
+    void logInfo('main', 'Blocked navigation away from the app', { url: event.url });
+  };
+  contents.on('will-navigate', blockForeignNavigation);
+  contents.on('will-frame-navigate', blockForeignNavigation);
+  contents.on('will-redirect', blockForeignNavigation);
+  contents.on('will-attach-webview', (event) => {
+    event.preventDefault();
+  });
+}
+
+function installPermissionHandlers() {
+  // Electron grants every permission by default; the remote only needs the microphone.
+  session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
+    const mediaTypes = 'mediaTypes' in details ? (details.mediaTypes ?? []) : [];
+    callback(
+      permission === 'media' &&
+        isMainWindowContents(contents) &&
+        isAppUrl(details.requestingUrl) &&
+        mediaTypes.length > 0 &&
+        mediaTypes.every((type) => type === 'audio')
+    );
+  });
+  session.defaultSession.setPermissionCheckHandler(
+    (contents, permission, _origin, details) =>
+      permission === 'media' && isMainWindowContents(contents) && details.mediaType !== 'video'
+  );
 }
 
 function _loadSvgIcon(size: number) {
@@ -137,6 +233,12 @@ function attachWindowDiagnostics(window: BrowserWindow) {
   window.webContents.on('render-process-gone', (_event, details) => {
     void preferences.setShortcutCapture(false);
     void logError('renderer', 'Render process exited unexpectedly', details);
+    if (isQuitting || window.isDestroyed()) return;
+    // A crashed renderer never comes back; keeping the window would make every
+    // later show display a blank frame. Replace it, reopening if it was visible.
+    const wasVisible = window.isVisible();
+    window.destroy();
+    if (wasVisible) void showWindow();
   });
 
   window.webContents.on('unresponsive', () => {
@@ -167,7 +269,8 @@ async function createWindow(): Promise<BrowserWindow> {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
+      webviewTag: false,
     },
   });
   // Renderer bootstrap IPC can arrive while loadFile is still pending.
@@ -179,6 +282,7 @@ async function createWindow(): Promise<BrowserWindow> {
   window.setSkipTaskbar(true);
 
   attachWindowDiagnostics(window);
+  hardenWebContents(window.webContents);
 
   const unsubscribeUpdater = subscribeUpdaterStatus((status) => {
     if (window.isDestroyed() || window.webContents.isDestroyed()) {
@@ -187,15 +291,12 @@ async function createWindow(): Promise<BrowserWindow> {
     window.webContents.send('updater:statusChanged', status);
   });
 
-  if (app.isPackaged || integrationEnvironment) {
-    await window.loadFile(getRendererEntryPath());
-  } else {
-    await window.loadURL('http://localhost:5173');
-  }
-
+  // Lifecycle handlers are attached before loading so a failed or slow load
+  // still cleans up and still auto-hides.
   window.on('blur', () => {
     void preferences.setShortcutCapture(false);
-    if (!window.webContents.isDevToolsOpened()) {
+    if (!window.webContents.isDevToolsOpened() && window.isVisible()) {
+      lastBlurHideAt = Date.now();
       window.hide();
     }
   });
@@ -208,25 +309,44 @@ async function createWindow(): Promise<BrowserWindow> {
     }
   });
 
+  try {
+    if (loadsBuiltRenderer()) {
+      await window.loadFile(getRendererEntryPath());
+    } else {
+      await window.loadURL(DEV_SERVER_ORIGIN);
+    }
+  } catch (error) {
+    if (!window.isDestroyed()) window.destroy();
+    throw error;
+  }
+
   return window;
 }
 
-async function ensureWindow(): Promise<BrowserWindow> {
+/** Concurrent callers (tray, shortcut, relaunch, bootstrap) share one window. */
+function ensureWindow(): Promise<BrowserWindow> {
   if (windowRef && !windowRef.isDestroyed()) {
-    return windowRef;
+    return Promise.resolve(windowRef);
   }
 
-  windowRef = await createWindow();
-  return windowRef;
+  windowCreation ??= createWindow().finally(() => {
+    windowCreation = undefined;
+  });
+  return windowCreation;
 }
 
 async function showWindow() {
-  const window = await ensureWindow();
-  window.show();
-  if (process.platform === 'darwin') {
-    app.focus({ steal: true });
+  try {
+    const window = await ensureWindow();
+    if (window.isDestroyed()) return;
+    window.show();
+    if (process.platform === 'darwin') {
+      app.focus({ steal: true });
+    }
+    window.focus();
+  } catch (error) {
+    await logError('main', 'Could not show the remote window', error);
   }
-  window.focus();
 }
 
 function hideWindow() {
@@ -237,11 +357,23 @@ function hideWindow() {
   windowRef.hide();
 }
 
-async function toggleWindow() {
-  const window = await ensureWindow();
+async function toggleWindow(fromTrayClick = false) {
+  let window: BrowserWindow;
+  try {
+    window = await ensureWindow();
+  } catch (error) {
+    await logError('main', 'Could not create the remote window', error);
+    return;
+  }
 
   if (window.isVisible()) {
     window.hide();
+    return;
+  }
+
+  // Clicking the menu-bar icon while the remote is open first blurs (and so
+  // hides) the window; that click means "hide", not "show again".
+  if (fromTrayClick && Date.now() - lastBlurHideAt < TRAY_CLICK_AFTER_BLUR_MS) {
     return;
   }
 
@@ -337,6 +469,22 @@ function buildApplicationMenu() {
 }
 
 async function showUpdaterResultDialog(status: UpdaterStatus) {
+  if (status.relaunchRequired) {
+    const choice = await showMessageBox({
+      type: 'info',
+      buttons: ['Relaunch now', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      icon: loadPngIcon(128),
+      title: 'Relaunch to Finish Updating',
+      message: status.message,
+    });
+    if (choice.response === 0) {
+      relaunchToFinishUpdate();
+    }
+    return;
+  }
+
   if (status.stage === 'failed') {
     await showMessageBox({
       type: 'warning',
@@ -417,32 +565,63 @@ async function showFirstLaunchHint(activeShortcut: string | null) {
   }
 }
 
+function createTray() {
+  tray = new Tray(createTrayImage());
+  tray.setToolTip(appName);
+  const trayMenu = buildContextMenu();
+  if (integrationEnvironment) recordIntegrationTrayMenu(trayMenu);
+  if (process.platform === 'darwin') {
+    // On macOS a menu installed with setContextMenu opens on every click, so the
+    // documented left-click toggle never happened. Show it on right-click only.
+    tray.on('right-click', () => {
+      tray?.popUpContextMenu(trayMenu);
+    });
+  } else {
+    tray.setContextMenu(trayMenu);
+  }
+  tray.on('click', () => {
+    void toggleWindow(true);
+  });
+}
+
+async function checkMicrophoneAccess() {
+  try {
+    if (!(await microphoneGranted())) {
+      await logInfo('main', 'Microphone access not granted — voice assistant will be unavailable');
+    }
+  } catch (error) {
+    await logError('main', 'Could not check microphone access', error);
+  }
+}
+
 async function bootstrapApp() {
   buildApplicationMenu();
   if (process.platform === 'darwin') {
     app.dock?.hide();
   }
-  const micGranted = await microphoneGranted();
-  if (!micGranted) {
-    await logInfo('main', 'Microphone access not granted — voice assistant will be unavailable');
-  }
-  windowRef = await createWindow();
-  tray = new Tray(createTrayImage());
-  tray.setToolTip(appName);
-  const trayMenu = buildContextMenu();
-  tray.setContextMenu(trayMenu);
-  if (integrationEnvironment) recordIntegrationTrayMenu(trayMenu);
-  tray.on('click', () => {
-    void toggleWindow();
+  installPermissionHandlers();
+  // Sockets that were open across sleep or a network change can be half-open and
+  // silently swallow key presses; reconnect instead of trusting them.
+  powerMonitor.on('resume', () => {
+    adapter.handleSystemResume();
   });
-
+  powerMonitor.on('unlock-screen', () => {
+    adapter.handleSystemResume();
+  });
+  // The menu-bar icon comes first so the app is reachable even if later steps stall.
+  createTray();
   await preferences.initialize();
+  await ensureWindow();
+  markBootstrapped();
   await logInfo('main', 'Application bootstrap complete', {
     shortcut: preferences.getState().activeShortcut,
     logPath: getLoggerPath(),
   });
   await showFirstLaunchHint(preferences.getState().activeShortcut);
   await showWindow();
+  // Asking macOS for microphone access can show a system prompt; it must not
+  // hold up startup (a relaunch during the prompt used to open a second window).
+  void checkMicrophoneAccess();
 
   setTimeout(() => {
     void checkForUpdatesInBackground();
@@ -456,46 +635,33 @@ if (!hasSingleInstanceLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    void showWindow();
+    void bootstrapped.then(showWindow);
   });
 
   app.on('activate', () => {
-    void checkForUpdatesInBackground();
-    void showWindow();
+    void bootstrapped.then(() => {
+      void checkForUpdatesInBackground();
+      void showWindow();
+    });
   });
 }
 
 function registerIpc() {
   const ch = INVOKE_CHANNELS;
-  const handle = <Args extends unknown[], Result>(
+  const handle = (
     channel: string,
-    listener: (event: Electron.IpcMainInvokeEvent, ...args: Args) => Result
-  ): ((event: Electron.IpcMainInvokeEvent, ...args: Args) => Result) => {
-    const guardedListener = (event: Electron.IpcMainInvokeEvent, ...args: Args): Result => {
-      if (
-        integrationEnvironment &&
-        (event.sender !== windowRef?.webContents ||
-          event.senderFrame !== event.sender.mainFrame ||
-          event.senderFrame.url !== pathToFileURL(getRendererEntryPath()).href)
-      )
-        throw new Error('Untrusted integration renderer request');
+    listener: (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => unknown
+  ) => {
+    ipcMain.handle(channel, (event, ...args: unknown[]) => {
+      if (!isTrustedSender(event)) throw new Error('Untrusted renderer request');
       return listener(event, ...args);
-    };
-    ipcMain.handle(channel, guardedListener);
-    return guardedListener;
+    });
   };
-  handle(ch.preferencesGet, (event) => {
-    if (event.sender !== windowRef?.webContents) throw new Error('Untrusted preferences request');
-    return preferences.refresh();
-  });
-  handle(ch.preferencesChange, (event, change: unknown) => {
-    if (event.sender !== windowRef?.webContents) throw new Error('Untrusted preferences request');
-    return preferences.change(change);
-  });
-  handle(ch.preferencesShortcutCapture, (event, recording: unknown) => {
-    if (event.sender !== windowRef?.webContents) throw new Error('Untrusted preferences request');
-    return preferences.setShortcutCapture(recording);
-  });
+  handle(ch.preferencesGet, () => preferences.refresh());
+  handle(ch.preferencesChange, (_event, change) => preferences.change(change));
+  handle(ch.preferencesShortcutCapture, (_event, recording) =>
+    preferences.setShortcutCapture(recording)
+  );
   handle(
     ch.deviceBootstrap,
     captureIpc(ch.deviceBootstrap, async () => adapter.getBootstrapState())
@@ -506,14 +672,14 @@ function registerIpc() {
   );
   handle(
     ch.deviceSave,
-    captureIpc(ch.deviceSave, async (_event: unknown, draft: DeviceDraft) =>
-      adapter.saveDevice(draft)
+    captureIpc(ch.deviceSave, async (_event: unknown, draft: unknown) =>
+      adapter.saveDevice(requireDeviceDraft(draft))
     )
   );
   handle(
     ch.deviceRemove,
-    captureIpc(ch.deviceRemove, async (_event: unknown, deviceId: string) =>
-      adapter.removeDevice(deviceId)
+    captureIpc(ch.deviceRemove, async (_event: unknown, deviceId: unknown) =>
+      adapter.removeDevice(requireDeviceId(deviceId))
     )
   );
   handle(
@@ -522,21 +688,21 @@ function registerIpc() {
   );
   handle(
     ch.deviceStartPairing,
-    captureIpc(ch.deviceStartPairing, async (_event: unknown, deviceId: string) =>
-      adapter.startPairing(deviceId)
+    captureIpc(ch.deviceStartPairing, async (_event: unknown, deviceId: unknown) =>
+      adapter.startPairing(requireDeviceId(deviceId))
     )
   );
   handle(
     ch.devicePair,
-    captureIpc(ch.devicePair, async (_event: unknown, request: PairingRequest) => {
-      await adapter.pair(request);
+    captureIpc(ch.devicePair, async (_event: unknown, request: unknown) => {
+      await adapter.pair(requirePairingRequest(request));
       return undefined;
     })
   );
   handle(
     ch.deviceConnect,
-    captureIpc(ch.deviceConnect, async (_event: unknown, deviceId: string) =>
-      adapter.connect(deviceId)
+    captureIpc(ch.deviceConnect, async (_event: unknown, deviceId: unknown) =>
+      adapter.connect(requireDeviceId(deviceId))
     )
   );
   handle(
@@ -545,15 +711,16 @@ function registerIpc() {
   );
   handle(
     ch.deviceCommand,
-    captureIpc(ch.deviceCommand, async (_event: unknown, request: CommandDispatchRequest) => {
+    captureIpc(ch.deviceCommand, async (_event: unknown, rawRequest: unknown) => {
+      const request = requireCommandRequest(rawRequest);
       commandMetricsStore.recordIpcReceived(request);
       return adapter.sendCommand(request);
     })
   );
   handle(
     ch.metricsRendererDrop,
-    captureIpc(ch.metricsRendererDrop, (_event: unknown, report: CommandDropReport) => {
-      commandMetricsStore.recordRendererDrop(report);
+    captureIpc(ch.metricsRendererDrop, (_event: unknown, report: unknown) => {
+      commandMetricsStore.recordRendererDrop(requireCommandDropReport(report));
       return Promise.resolve();
     })
   );
@@ -563,7 +730,9 @@ function registerIpc() {
   );
   handle(
     ch.deviceText,
-    captureIpc(ch.deviceText, async (_event: unknown, text: string) => adapter.sendText(text))
+    captureIpc(ch.deviceText, async (_event: unknown, text: unknown) =>
+      adapter.sendText(requireTextInput(text))
+    )
   );
   handle(
     ch.deviceAssistantVoiceStart,
@@ -577,14 +746,17 @@ function registerIpc() {
     ch.deviceAssistantVoiceChunk,
     captureIpc(
       ch.deviceAssistantVoiceChunk,
-      async (_event: unknown, sessionId: number, chunkBase64: string) =>
-        adapter.sendAssistantVoiceChunk(sessionId, chunkBase64)
+      async (_event: unknown, sessionId: unknown, chunkBase64: unknown) =>
+        adapter.sendAssistantVoiceChunk(
+          requireVoiceSessionId(sessionId),
+          requireVoiceChunk(chunkBase64)
+        )
     )
   );
   handle(
     ch.deviceAssistantVoiceStop,
-    captureIpc(ch.deviceAssistantVoiceStop, async (_event: unknown, sessionId: number) =>
-      adapter.stopAssistantVoice(sessionId)
+    captureIpc(ch.deviceAssistantVoiceStop, async (_event: unknown, sessionId: unknown) =>
+      adapter.stopAssistantVoice(requireVoiceSessionId(sessionId))
     )
   );
   handle(
@@ -622,12 +794,21 @@ function registerIpc() {
 if (hasSingleInstanceLock) {
   void app.whenReady().then(async () => {
     try {
-      initCapture(app.isPackaged ? app.getAppPath() : path.resolve(__dirname, '..', '..'));
+      // Packaged apps cannot write inside app.asar; capture to the profile instead.
+      initCapture(app.isPackaged ? app.getPath('userData') : path.resolve(__dirname, '..', '..'));
       registerIpc();
       await bootstrapApp();
     } catch (error) {
       await logError('main', 'Application bootstrap failed', error);
-      throw error;
+      // Without this the process would linger with no window or menu-bar icon while
+      // still holding the single-instance lock, so relaunching could not recover.
+      if (!integrationEnvironment) {
+        dialog.showErrorBox(
+          'GTV Remote could not start',
+          `${error instanceof Error ? error.message : String(error)}\n\nDetails were written to ${getLoggerPath()}.`
+        );
+      }
+      app.exit(1);
     }
   });
 }
@@ -640,8 +821,13 @@ process.on('unhandledRejection', (reason) => {
   void logError('main', 'Unhandled rejection', reason);
 });
 
+app.on('before-quit', () => {
+  isQuitting = true;
+});
+
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
+  stopDiscovery();
   closeCapture();
 });
 

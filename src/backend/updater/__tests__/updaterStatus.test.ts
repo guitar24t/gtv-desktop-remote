@@ -5,6 +5,7 @@ import {
   applyUpdaterEvent,
   createInitialUpdaterStatus,
   mergeUpdaterStatus,
+  relaunchToFinishMessage,
   type UpdaterEvent,
 } from '../updaterStatus';
 
@@ -495,6 +496,7 @@ describe('applyUpdaterEvent — every event transition', () => {
       {
         type: 'check-completed-no-asset',
         latestVersion: '2.5.0',
+        lastCheckedAt: '2026-11-12T10:00:00.000Z',
         message: 'Release 2.5.0 has no compatible macOS asset.',
       },
       V
@@ -503,6 +505,8 @@ describe('applyUpdaterEvent — every event transition', () => {
       inProgress: false,
       stage: 'failed',
       latestVersion: '2.5.0',
+      // The no-asset path is a completed check: it must stamp the check time.
+      lastCheckedAt: '2026-11-12T10:00:00.000Z',
       updateAvailable: true,
       updateInstallable: false,
       message: 'Release 2.5.0 has no compatible macOS asset.',
@@ -515,6 +519,7 @@ describe('applyUpdaterEvent — every event transition', () => {
       {
         type: 'check-completed-no-asset',
         latestVersion: '2.5.0',
+        lastCheckedAt: '2026-11-12T10:00:00.000Z',
         message: 'no asset',
       },
       V
@@ -543,5 +548,74 @@ describe('applyUpdaterEvent — every event transition', () => {
     expect(cleared.rollbackAvailable).toBe(false);
     expect(cleared.rollbackVersion).toBeUndefined();
     expect(cleared.rollbackCreatedAt).toBeUndefined();
+  });
+
+  // ── pending relaunch ──────────────────────────────────────────────
+
+  it('install-completed with relaunchRequired reports the installed version and a relaunch prompt', () => {
+    const next = applyUpdaterEvent(
+      initial,
+      { type: 'install-completed', latestVersion: '2.3.0', relaunchRequired: true },
+      '2.2.0'
+    );
+    expect(next).toMatchObject({
+      inProgress: false,
+      stage: 'completed',
+      currentVersion: '2.2.0',
+      relaunchRequired: true,
+      installedVersion: '2.3.0',
+      updateAvailable: false,
+      updateInstallable: false,
+      message: 'Update 2.3.0 installed. Relaunch GTV Remote to finish.',
+    });
+    expect(next.message).toBe(relaunchToFinishMessage('Update 2.3.0 installed.'));
+  });
+
+  it('install-completed without relaunchRequired (dev mode) does not claim a pending relaunch', () => {
+    const next = applyUpdaterEvent(
+      initial,
+      {
+        type: 'install-completed',
+        latestVersion: '2.3.0',
+        message: 'Dev mode: install step skipped.',
+      },
+      V
+    );
+    expect(next.relaunchRequired).toBeUndefined();
+    expect(next.installedVersion).toBeUndefined();
+  });
+
+  it('rollback-completed with relaunchRequired reports the restored version', () => {
+    const next = applyUpdaterEvent(
+      initial,
+      { type: 'rollback-completed', restoredVersion: '2.2.0', relaunchRequired: true },
+      V
+    );
+    expect(next).toMatchObject({
+      stage: 'completed',
+      relaunchRequired: true,
+      installedVersion: '2.2.0',
+      rollbackAvailable: false,
+      message: 'Rolled back to 2.2.0. Relaunch GTV Remote to finish.',
+    });
+  });
+
+  it('later rollback-availability events keep the pending relaunch fields', () => {
+    const installed = applyUpdaterEvent(
+      initial,
+      { type: 'install-completed', latestVersion: '2.3.0', relaunchRequired: true },
+      V
+    );
+    const withBackup = applyUpdaterEvent(
+      installed,
+      {
+        type: 'rollback-availability-changed',
+        available: true,
+        version: '2.2.0',
+        createdAt: '2026-11-12T10:00:00.000Z',
+      },
+      V
+    );
+    expect(withBackup).toMatchObject({ relaunchRequired: true, installedVersion: '2.3.0' });
   });
 });

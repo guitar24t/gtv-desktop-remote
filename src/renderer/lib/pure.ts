@@ -57,10 +57,25 @@ export function classes(...values: (string | false | null | undefined)[]): strin
  * scratch (re-fetch a fresh 6-character code) rather than retry the same
  * code. Regex encodes the phrases the backend emits via androidtv-remote's
  * pairing protocol, including the local certificate hash validation error
- * thrown when the entered code does not match the TV's certificate.
+ * thrown when the entered code does not match the TV's certificate, and the
+ * "Start pairing again." error raised when the TV rejects the saved client
+ * certificate. A host/identity mismatch ("does not match the paired TV")
+ * deliberately does not match: it needs a rescan, not a new pairing.
  */
 export function shouldRestartPairingFlow(message: string): boolean {
-  return /invalid pairing code|request a new code|no pairing session is active|pairing failed|certificate hash validation/i.test(
+  return /invalid pairing code|request a new code|no pairing session is active|pairing failed|certificate hash validation|start pairing again/i.test(
+    message
+  );
+}
+
+/**
+ * Detects command errors that mean no TV session can accept further
+ * commands until the user acts (reconnects, re-pairs, or rescans). The
+ * remote command queue drops whatever is still pending after one of these
+ * instead of failing every queued command in turn.
+ */
+export function isConnectionUnavailableError(message: string): boolean {
+  return /no active device connected|start pairing again|does not match the paired tv|desktop bridge unavailable/i.test(
     message
   );
 }

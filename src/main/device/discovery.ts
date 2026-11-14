@@ -1,7 +1,11 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
-import { parseDnsSdTxtLine } from '../../backend/discovery/dnsSdEncoding';
+import {
+  parseDnsSdAddressOutput,
+  parseDnsSdBrowseOutput,
+  parseDnsSdResolveOutput,
+} from '../../backend/discovery/dnsSdOutput';
 import type { DiscoveredDevice } from '../../shared/types';
 import { record } from '../capture';
 import { assertLoopbackHost, integrationEnvironment } from '../integrationEnvironment';
@@ -27,6 +31,25 @@ function buildDeviceFingerprint(name: string, model?: string): string | undefine
   return `${normalizedName}::${normalizedModel}`;
 }
 
+// `dns-sd -B/-L/-G` never exit on their own; every child is tracked so app
+// shutdown can kill the ones still inside their browse window.
+const activeChildren = new Set<ChildProcess>();
+
+/**
+ * Kills every running `dns-sd` child. Call on app quit so no browse/resolve
+ * process outlives the app. In-flight scans resolve with what they had.
+ */
+export function stopDiscovery(): void {
+  for (const child of activeChildren) {
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      // Already exited.
+    }
+  }
+  activeChildren.clear();
+}
+
 function runDnsSd(args: string[], timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(integrationEnvironment?.discoveryCommand ?? 'dns-sd', args, {
@@ -35,6 +58,7 @@ function runDnsSd(args: string[], timeoutMs: number): Promise<string> {
         ? { ...process.env, GTV_DNS_SD_STATE: integrationEnvironment.discoveryStatePath }
         : process.env,
     });
+    activeChildren.add(child);
 
     let stdout = '';
     let stderr = '';
@@ -59,6 +83,7 @@ function runDnsSd(args: string[], timeoutMs: number): Promise<string> {
     });
 
     child.on('error', (error) => {
+      activeChildren.delete(child);
       if (settled) {
         return;
       }
@@ -69,6 +94,7 @@ function runDnsSd(args: string[], timeoutMs: number): Promise<string> {
     });
 
     child.on('close', (code) => {
+      activeChildren.delete(child);
       if (settled) {
         return;
       }
@@ -88,78 +114,39 @@ function runDnsSd(args: string[], timeoutMs: number): Promise<string> {
 
 async function browseServiceInstances(serviceType: string, timeoutMs = 2500): Promise<string[]> {
   const output = await runDnsSd(['-B', serviceType, 'local.'], timeoutMs);
-  const lines = output.split(/\r?\n/);
-  const instances = new Set<string>();
-
-  for (const line of lines) {
-    if (!line.includes(' Add ') || !line.includes(serviceType)) {
-      continue;
-    }
-
-    const parts = line.trim().split(/\s{2,}/);
-    const instanceName = parts[parts.length - 1]?.trim();
-    if (instanceName && instanceName !== '...STARTING...') {
-      instances.add(instanceName);
-    }
-  }
-
-  return [...instances];
+  return parseDnsSdBrowseOutput(output, serviceType);
 }
 
 async function resolveService(
   instanceName: string,
   serviceType: string
 ): Promise<ResolvedService | null> {
+  // `-L` takes the raw instance name exactly as browse printed it.
   const output = await runDnsSd(['-L', instanceName, serviceType, 'local.'], 2000);
-  const lines = output.split(/\r?\n/);
-  let hostName: string | undefined;
-  let port: number | undefined;
-  let txt: Record<string, string> = {};
-
-  for (const line of lines) {
-    const endpointMatch = /can be reached at\s+(.+?):(\d+)/.exec(line);
-    if (endpointMatch) {
-      hostName = endpointMatch[1].trim();
-      port = Number(endpointMatch[2]);
-      continue;
-    }
-
-    if (line.includes('=')) {
-      txt = { ...txt, ...parseDnsSdTxtLine(line) };
-    }
-  }
-
-  if (!hostName) {
+  const resolved = parseDnsSdResolveOutput(output);
+  if (!resolved) {
     return null;
   }
 
-  const host = await resolveHostToIp(hostName);
+  const host = await resolveHostToIp(resolved.hostName);
   if (!host) {
     return null;
   }
 
   return {
     instanceName,
-    hostName,
+    hostName: resolved.hostName,
     host,
-    port,
-    txt,
+    port: resolved.port,
+    txt: resolved.txt,
   };
 }
 
 async function resolveHostToIp(hostName: string): Promise<string | undefined> {
   const output = await runDnsSd(['-G', 'v4', hostName], 2000);
-  const lines = output.split(/\r?\n/);
-
-  for (const line of lines) {
-    const match = /\s((?:\d{1,3}\.){3}\d{1,3})\s+\d+\s*$/.exec(line);
-    if (match?.[1]) {
-      if (integrationEnvironment) assertLoopbackHost(match[1]);
-      return match[1];
-    }
-  }
-
-  return undefined;
+  const address = parseDnsSdAddressOutput(output);
+  if (address && integrationEnvironment) assertLoopbackHost(address);
+  return address;
 }
 
 export async function discoverGoogleTvDevices(): Promise<DiscoveredDevice[]> {

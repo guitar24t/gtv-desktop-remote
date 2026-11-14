@@ -75,6 +75,7 @@ export type UpdaterEvent =
   | {
       type: 'check-completed-no-asset';
       latestVersion: string;
+      lastCheckedAt: string;
       message: string;
     }
   | {
@@ -98,7 +99,13 @@ export type UpdaterEvent =
       latestVersion: string;
     }
   | { type: 'install-started'; message?: string }
-  | { type: 'install-completed'; latestVersion: string; message?: string }
+  | {
+      type: 'install-completed';
+      latestVersion: string;
+      message?: string;
+      /** The bundle on disk was replaced; the running process is still the old version. */
+      relaunchRequired?: boolean;
+    }
   | { type: 'install-failed'; message: string }
   | {
       type: 'rollback-started';
@@ -106,7 +113,13 @@ export type UpdaterEvent =
       message?: string;
       progressPercent?: number;
     }
-  | { type: 'rollback-completed'; message?: string }
+  | {
+      type: 'rollback-completed';
+      message?: string;
+      /** Version restored on disk. */
+      restoredVersion?: string;
+      relaunchRequired?: boolean;
+    }
   | { type: 'rollback-failed'; message: string }
   | {
       type: 'rollback-unavailable';
@@ -119,6 +132,11 @@ export type UpdaterEvent =
       createdAt?: string;
     }
   | { type: 'message'; message: string };
+
+/** Status text shown while a replaced bundle is waiting for the app to relaunch. */
+export function relaunchToFinishMessage(prefix: string): string {
+  return `${prefix} Relaunch GTV Remote to finish.`;
+}
 
 /**
  * Pure reducer: returns a new `UpdaterStatus` for the given event. The
@@ -167,6 +185,7 @@ export function applyUpdaterEvent(
           inProgress: false,
           stage: 'failed',
           latestVersion: event.latestVersion,
+          lastCheckedAt: event.lastCheckedAt,
           updateAvailable: true,
           updateInstallable: false,
           message: event.message,
@@ -253,7 +272,14 @@ export function applyUpdaterEvent(
           etaSeconds: 0,
           updateAvailable: false,
           updateInstallable: false,
-          message: event.message ?? `Installed ${event.latestVersion}. Relaunching…`,
+          ...(event.relaunchRequired
+            ? { relaunchRequired: true, installedVersion: event.latestVersion }
+            : {}),
+          message:
+            event.message ??
+            (event.relaunchRequired
+              ? relaunchToFinishMessage(`Update ${event.latestVersion} installed.`)
+              : `Installed ${event.latestVersion}. Relaunching…`),
         },
         currentVersion
       );
@@ -296,7 +322,18 @@ export function applyUpdaterEvent(
           rollbackCreatedAt: undefined,
           updateAvailable: false,
           updateInstallable: false,
-          message: event.message ?? 'Rollback complete. Relaunching…',
+          ...(event.relaunchRequired
+            ? { relaunchRequired: true, installedVersion: event.restoredVersion }
+            : {}),
+          message:
+            event.message ??
+            (event.relaunchRequired
+              ? relaunchToFinishMessage(
+                  event.restoredVersion
+                    ? `Rolled back to ${event.restoredVersion}.`
+                    : 'Rollback complete.'
+                )
+              : 'Rollback complete. Relaunching…'),
         },
         currentVersion
       );

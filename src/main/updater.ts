@@ -1,9 +1,34 @@
-import { promises as fs } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { constants as fsConstants, promises as fs } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
 import { app, BrowserWindow, shell } from 'electron';
 
 import { getRuntimeConfig } from '../backend/core/runtimeConfig';
+import {
+  hiddenSiblingPath,
+  moveDirectory,
+  swapBundleIntoPlace,
+  type BundleFileOps,
+} from '../backend/updater/bundleSwap';
+import { shouldRunBackgroundCheck, type CheckAttempt } from '../backend/updater/checkSchedule';
+import {
+  assertInstallLocationWritable,
+  UpdaterUserError,
+} from '../backend/updater/installLocation';
+import {
+  assertBundleMatches,
+  DownloadVerifier,
+  parseSha256Digest,
+  readBundleMetadata,
+  type BundleMetadata,
+  type DownloadDigest,
+  type ExpectedDownload,
+} from '../backend/updater/integrity';
+import { latestReleaseApiUrl } from '../backend/updater/releaseSource';
 import {
   applyUpdaterEvent,
   createInitialUpdaterStatus,
@@ -34,6 +59,8 @@ interface ReleaseAsset {
   name: string;
   browser_download_url: string;
   size: number;
+  /** GitHub's `"sha256:<hex>"` digest of the asset. */
+  digest?: string | null;
 }
 
 interface ReleasePayload {
@@ -49,30 +76,44 @@ interface UpdateState {
   rollbackBundleName?: string;
 }
 
-const RELEASE_OWNER = 'usrivastava92';
-const RELEASE_REPO = 'gtv-desktop-remote';
+/** An install or rollback; at most one runs at a time. */
+interface UpdaterOperation {
+  kind: 'install' | 'rollback';
+  promise: Promise<UpdaterStatus>;
+}
+
+/** The bundle on disk was replaced; the running process is the previous version until relaunch. */
+interface PendingRelaunch {
+  version: string;
+  reason: 'update' | 'rollback';
+}
+
 const CHECK_TIMEOUT_MS = 15_000;
-const BACKGROUND_CHECK_DEBOUNCE_MS = 15 * 60 * 1_000;
 const ROLLBACK_DIR_NAME = 'rollback';
+const CODESIGN_PATH = '/usr/bin/codesign';
+const PLUTIL_PATH = '/usr/bin/plutil';
 
 let cachedRelease: ReleasePayload | undefined;
 let cachedAsset: ReleaseAsset | undefined;
-let activeBackgroundCheck: Promise<void> | undefined;
+let activeCheck: Promise<void> | undefined;
+let activeOperation: UpdaterOperation | undefined;
+let pendingRelaunch: PendingRelaunch | undefined;
+let lastCheckAttempt: CheckAttempt | undefined;
 
 const updaterStatus: UpdaterStatus = createInitialUpdaterStatus(updaterVersion());
 
 /**
  * Subscribers receive a fresh snapshot of `UpdaterStatus` every time the
  * status changes. Registered by `subscribeUpdaterStatus` and called
- * synchronously from `setUpdaterStatus`. QW-2 uses this to push the status
- * to the renderer over IPC, replacing the previous 1.5s polling loop.
+ * synchronously from `dispatchUpdaterEvent`, which pushes the status to the
+ * renderer over IPC.
  */
 type UpdaterStatusListener = (status: UpdaterStatus) => void;
 const updaterStatusListeners = new Set<UpdaterStatusListener>();
 
 /** Snapshot the current status. Defensive copy so callers cannot mutate. */
 function snapshotUpdaterStatus(): UpdaterStatus {
-  return { ...updaterStatus };
+  return { ...updaterStatus, currentVersion: updaterVersion() };
 }
 
 /**
@@ -87,18 +128,9 @@ export function subscribeUpdaterStatus(listener: UpdaterStatusListener): () => v
 }
 
 /**
- * setUpdaterStatus() has been fully retired — all 16 original call
- * sites have been migrated to dispatchUpdaterEvent() across PRs 6a–6h.
- * The function has been deleted. All status transitions now go through the
- * pure UpdaterEvent reducer in src/backend/updater/updaterStatus.ts.
- *
- * dispatch a typed `UpdaterEvent` and let `applyUpdaterEvent` (the
- * pure reducer in src/backend/updater/updaterStatus.ts) compute the new
- * status. Identical listener fan-out as the now-deleted `setUpdaterStatus`.
- *
- * This is the migration target for the 16+ inline `setUpdaterStatus({...})`
- * call sites. Migration is per-site and can land incrementally; both code
- * paths produce byte-identical output via the same reducer.
+ * All status transitions go through the pure `applyUpdaterEvent` reducer in
+ * src/backend/updater/updaterStatus.ts; this applies the result and fans it
+ * out to listeners.
  */
 function dispatchUpdaterEvent(event: UpdaterEvent) {
   const next = applyUpdaterEvent(updaterStatus, event, updaterVersion());
@@ -106,7 +138,6 @@ function dispatchUpdaterEvent(event: UpdaterEvent) {
   publishUpdaterStatus();
 }
 
-/** Shared fan-out used by both `setUpdaterStatus` and `dispatchUpdaterEvent`. */
 function publishUpdaterStatus() {
   const snapshot = snapshotUpdaterStatus();
   for (const listener of updaterStatusListeners) {
@@ -152,7 +183,20 @@ async function showUpdaterDialog(
   return await showMessageBox(options);
 }
 
-// normalizeVersion + compareVersions extracted to src/backend/updater/version.ts.
+function isDevModeOverride(): boolean {
+  return !integrationEnvironment && getRuntimeConfig().devUpdaterEnabled && !app.isPackaged;
+}
+
+/** Real macOS only: the integration sandbox has no signed bundles and no codesign. */
+function nativeSignatureVerificationEnabled(): boolean {
+  return process.platform === 'darwin' && !integrationEnvironment;
+}
+
+function uniqueStamp(): string {
+  return `${String(Date.now())}-${randomBytes(4).toString('hex')}`;
+}
+
+// ── persisted updater state ─────────────────────────────────────────────────
 
 async function readUpdateState(): Promise<UpdateState> {
   const statePath = getAppDataPath('updater-state.json');
@@ -215,6 +259,51 @@ async function clearRollbackBackup(state?: UpdateState) {
   dispatchUpdaterEvent({ type: 'rollback-availability-changed', available: false });
 }
 
+// ── bundle metadata ─────────────────────────────────────────────────────────
+
+async function readInfoPlist(bundlePath: string): Promise<string> {
+  const plistPath = path.join(bundlePath, 'Contents', 'Info.plist');
+  assertIntegrationPath(plistPath);
+  const raw = await fs.readFile(plistPath);
+  if (
+    raw.subarray(0, 6).toString('latin1') === 'bplist' &&
+    process.platform === 'darwin' &&
+    !integrationEnvironment
+  ) {
+    // Binary property lists are converted by the system tool rather than parsed here.
+    const { stdout } = await promisify(execFile)(
+      PLUTIL_PATH,
+      ['-convert', 'xml1', '-o', '-', plistPath],
+      { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 }
+    );
+    return stdout;
+  }
+  return raw.toString('utf8');
+}
+
+async function readBundleInfo(bundlePath: string): Promise<BundleMetadata> {
+  return readBundleMetadata(await readInfoPlist(bundlePath));
+}
+
+async function readBundleInfoOrEmpty(bundlePath: string): Promise<BundleMetadata> {
+  try {
+    return await readBundleInfo(bundlePath);
+  } catch {
+    return {};
+  }
+}
+
+/** The identifier every replacement bundle must carry: the installed (running) app's. */
+async function readInstalledBundleIdentifier(targetBundle: string): Promise<string> {
+  const { identifier } = await readBundleInfoOrEmpty(targetBundle);
+  if (!identifier) {
+    throw new Error(
+      `Could not read the bundle identifier of the installed app at "${targetBundle}"; refusing to replace it.`
+    );
+  }
+  return identifier;
+}
+
 /**
  * Look for a stray rollback bundle on disk that isn't referenced by update-state.json
  * and recover its metadata. This heals state when a previous install partially
@@ -242,20 +331,7 @@ async function recoverOrphanedRollbackState(state: UpdateState): Promise<UpdateS
       return state;
     }
 
-    let recoveredVersion: string | undefined;
-    try {
-      const infoPlist = await fs.readFile(path.join(bundlePath, 'Contents', 'Info.plist'), 'utf-8');
-      const match = /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/.exec(
-        infoPlist
-      );
-      const version = match?.[1];
-      if (version !== undefined) {
-        recoveredVersion = normalizeVersion(version);
-      }
-    } catch {
-      // ignore, fall through to mtime/unknown
-    }
-
+    const recoveredVersion = (await readBundleInfoOrEmpty(bundlePath)).version;
     const recoveredState: UpdateState = {
       ...state,
       rollbackBundleName: bundle,
@@ -303,7 +379,17 @@ async function syncRollbackStatus() {
   return state;
 }
 
-// formatMinutesUntil extracted to src/backend/updater/version.ts.
+// ── GitHub release lookup ───────────────────────────────────────────────────
+
+class GitHubRateLimitError extends Error {
+  constructor(
+    message: string,
+    readonly retryNotBefore?: number
+  ) {
+    super(message);
+    this.name = 'GitHubRateLimitError';
+  }
+}
 
 async function requestJson<T>(url: string): Promise<T> {
   const controller = new AbortController();
@@ -327,15 +413,22 @@ async function requestJson<T>(url: string): Promise<T> {
       const resetHeader = response.headers.get('x-ratelimit-reset');
       const retryAfter = response.headers.get('retry-after');
 
-      if (response.status === 403 && remaining === '0') {
+      if ((response.status === 403 && remaining === '0') || response.status === 429) {
         const resetSeconds = Number.parseInt(resetHeader ?? '', 10);
+        const retryAfterSeconds = Number.parseInt(retryAfter ?? '', 10);
         const when = Number.isFinite(resetSeconds)
           ? formatMinutesUntil(resetSeconds)
-          : retryAfter
-            ? `in about ${retryAfter} seconds`
+          : Number.isFinite(retryAfterSeconds)
+            ? `in about ${String(retryAfterSeconds)} seconds`
             : 'shortly';
-        throw new Error(
-          `GitHub API rate limit reached for this network. Please try again ${when}.`
+        const retryNotBefore = Number.isFinite(resetSeconds)
+          ? resetSeconds * 1_000
+          : Number.isFinite(retryAfterSeconds)
+            ? Date.now() + retryAfterSeconds * 1_000
+            : undefined;
+        throw new GitHubRateLimitError(
+          `GitHub API rate limit reached for this network. Please try again ${when}.`,
+          retryNotBefore
         );
       }
 
@@ -355,7 +448,25 @@ async function requestJson<T>(url: string): Promise<T> {
   }
 }
 
-// isDmgAsset + findBestMacAsset extracted to src/backend/updater/version.ts.
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function assertReleasePayload(release: unknown): asserts release is ReleasePayload {
+  if (
+    !isRecord(release) ||
+    typeof release.tag_name !== 'string' ||
+    !Array.isArray(release.assets) ||
+    !release.assets.every(
+      (asset: unknown) =>
+        isRecord(asset) &&
+        typeof asset.name === 'string' &&
+        typeof asset.browser_download_url === 'string'
+    )
+  ) {
+    throw new Error('GitHub returned an unexpected release response.');
+  }
+}
 
 function getBundlePathFromExecPath() {
   return (
@@ -364,6 +475,8 @@ function getBundlePathFromExecPath() {
   );
 }
 
+// ── file operations ─────────────────────────────────────────────────────────
+
 /**
  * Best-effort recursive delete that works reliably for macOS .app bundles
  * (Node's fs.rm({ recursive: true }) intermittently throws ENOTEMPTY on Resources
@@ -371,6 +484,7 @@ function getBundlePathFromExecPath() {
  * native API first and fall back to shelling out to `rm -rf`.
  */
 async function removePathRecursive(target: string): Promise<void> {
+  assertIntegrationPath(target);
   try {
     await fs.rm(target, { force: true, recursive: true });
     return;
@@ -384,46 +498,81 @@ async function removePathRecursive(target: string): Promise<void> {
   }
 }
 
-async function createRollbackBackup(targetBundle: string) {
-  const state = await readUpdateState();
-  const rollbackDir = getRollbackDirPath();
-  const rollbackBundleName = path.basename(targetBundle);
-  const rollbackBundlePath = path.join(rollbackDir, rollbackBundleName);
-  const rollbackVersion = normalizeVersion(updaterVersion());
-  const rollbackCreatedAt = new Date().toISOString();
+/**
+ * Renames happen in Node (same-volume, atomic); copies go through `ditto`,
+ * which preserves symlinks, extended attributes and code signatures. In the
+ * integration sandbox every path is checked against the isolated profile.
+ */
+const bundleFileOps: BundleFileOps = {
+  async rename(from, to) {
+    assertIntegrationPath(from);
+    assertIntegrationPath(to);
+    await fs.rename(from, to);
+  },
+  async copyDirectory(from, to) {
+    await runNativeCommand('ditto', [from, to]);
+  },
+  async remove(target) {
+    await removePathRecursive(target);
+  },
+};
 
-  await logInfo('updater', 'Creating rollback backup', {
-    sourceBundle: targetBundle,
-    rollbackBundlePath,
-    rollbackVersion,
-  });
-
-  const stagingDir = `${rollbackDir}.new-${String(Date.now())}`;
-  const stagingBundlePath = path.join(stagingDir, rollbackBundleName);
-  const previousRollbackDir = `${rollbackDir}.prev-${String(Date.now())}`;
-
+async function canWrite(target: string): Promise<boolean> {
   try {
-    await removePathRecursive(stagingDir);
-    await fs.mkdir(stagingDir, { recursive: true });
-    await runNativeCommand('ditto', [targetBundle, stagingBundlePath]);
-  } catch (error) {
-    await logError(
-      'updater',
-      'Failed to stage rollback backup; preserving previous rollback (if any) and continuing install',
-      error
-    );
-    await removePathRecursive(stagingDir).catch(() => {
-      // ignore staging cleanup failure
-    });
-    await syncRollbackStatus();
-    return;
+    await fs.access(target, fsConstants.W_OK);
+    return true;
+  } catch {
+    return false;
   }
+}
 
-  // Atomically swap the staged backup in place of the existing one.
+/**
+ * Turn the bundle that was moved aside by an install into the rollback backup.
+ * It is moved (or copied, across volumes) into a staging folder, which then
+ * replaces the previous rollback folder. Never throws: the update itself has
+ * already been installed, so a failure here only keeps the older backup.
+ */
+async function preserveRollbackBackup(asideBundle: string, bundleName: string): Promise<void> {
+  const rollbackDir = getRollbackDirPath();
+  const stamp = uniqueStamp();
+  const stagingDir = `${rollbackDir}.new-${stamp}`;
+  const stagingBundlePath = path.join(stagingDir, bundleName);
+  const previousRollbackDir = `${rollbackDir}.prev-${stamp}`;
+
   try {
+    const state = await readUpdateState();
+    // Label the backup with the version it actually contains.
+    const rollbackVersion =
+      (await readBundleInfoOrEmpty(asideBundle)).version ?? normalizeVersion(updaterVersion());
+    const rollbackCreatedAt = new Date().toISOString();
+
+    await logInfo('updater', 'Preserving previous version for rollback', {
+      sourceBundle: asideBundle,
+      rollbackBundlePath: path.join(rollbackDir, bundleName),
+      rollbackVersion,
+    });
+
+    try {
+      await removePathRecursive(stagingDir);
+      await fs.mkdir(stagingDir, { recursive: true });
+      await moveDirectory(bundleFileOps, asideBundle, stagingBundlePath);
+    } catch (error) {
+      await logError(
+        'updater',
+        'Failed to stage rollback backup; preserving previous rollback (if any)',
+        error
+      );
+      await removePathRecursive(stagingDir).catch(() => {
+        // ignore staging cleanup failure
+      });
+      await syncRollbackStatus();
+      return;
+    }
+
+    // Swap the staged backup in place of the existing one.
     let movedExisting = false;
     try {
-      await fs.rename(rollbackDir, previousRollbackDir);
+      await bundleFileOps.rename(rollbackDir, previousRollbackDir);
       movedExisting = true;
     } catch (error) {
       // ENOENT just means there was no previous rollback dir — fine to proceed.
@@ -433,11 +582,10 @@ async function createRollbackBackup(targetBundle: string) {
     }
 
     try {
-      await fs.rename(stagingDir, rollbackDir);
+      await bundleFileOps.rename(stagingDir, rollbackDir);
     } catch (swapError) {
-      // Restore previous rollback if the swap-in failed.
       if (movedExisting) {
-        await fs.rename(previousRollbackDir, rollbackDir).catch(() => {
+        await bundleFileOps.rename(previousRollbackDir, rollbackDir).catch(() => {
           // best-effort restore
         });
       }
@@ -454,9 +602,8 @@ async function createRollbackBackup(targetBundle: string) {
       ...state,
       rollbackVersion,
       rollbackCreatedAt,
-      rollbackBundleName,
+      rollbackBundleName: bundleName,
     });
-    // rollback bundle created, announce availability
     dispatchUpdaterEvent({
       type: 'rollback-availability-changed',
       available: true,
@@ -468,50 +615,116 @@ async function createRollbackBackup(targetBundle: string) {
       'updater',
       'Failed to swap in new rollback backup; existing rollback (if any) preserved',
       error
-    );
+    ).catch(() => undefined);
     await removePathRecursive(stagingDir).catch(() => {
       // ignore
     });
-    await syncRollbackStatus();
+    await syncRollbackStatus().catch(() => undefined);
+  } finally {
+    // Never leave the replaced bundle hidden next to the installed app.
+    await removePathRecursive(asideBundle).catch(() => {
+      // ignore
+    });
   }
 }
 
-async function installMacUpdateFromZip(zipPath: string) {
-  const unpackDir = path.join(
-    updaterTemporaryDirectory(),
-    `gtv-update-unpack-${String(Date.now())}`
-  );
+// ── install ─────────────────────────────────────────────────────────────────
+
+interface InstallFromZipOptions {
+  zipPath: string;
+  unpackDir: string;
+  targetBundle: string;
+  version: string;
+  devModeOverride: boolean;
+}
+
+/**
+ * Extract and verify the downloaded bundle, stage it beside the installed app,
+ * then swap it into place (restoring the original on failure). The replaced
+ * bundle becomes the rollback backup.
+ */
+async function installMacUpdateFromZip(options: InstallFromZipOptions) {
+  const { zipPath, unpackDir, targetBundle, version, devModeOverride } = options;
   assertIntegrationPath(unpackDir);
   await fs.mkdir(unpackDir, { recursive: true });
 
   await runNativeCommand('ditto', ['-x', '-k', zipPath, unpackDir]);
 
   const entries = await fs.readdir(unpackDir, { withFileTypes: true });
-  const appDir = entries.find((entry) => entry.isDirectory() && entry.name.endsWith('.app'));
+  const appDirs = entries.filter((entry) => entry.isDirectory() && entry.name.endsWith('.app'));
+  const appDir = appDirs.at(0);
   if (!appDir) {
     throw new Error('Downloaded archive did not contain an .app bundle');
   }
+  if (appDirs.length > 1) {
+    throw new Error('Downloaded archive contained more than one .app bundle');
+  }
 
   const sourceBundle = path.join(unpackDir, appDir.name);
-  const targetBundle = getBundlePathFromExecPath();
-
   await logInfo('updater', 'Installing update bundle', { sourceBundle, targetBundle });
 
-  if (!integrationEnvironment && getRuntimeConfig().devUpdaterEnabled && !app.isPackaged) {
+  if (devModeOverride) {
     await logInfo('updater', 'Dev mode update install skipped', { sourceBundle, targetBundle });
     return;
   }
 
-  await createRollbackBackup(targetBundle);
-  await runNativeCommand('ditto', [sourceBundle, targetBundle]);
-  await runNativeCommand('xattr', ['-dr', 'com.apple.quarantine', targetBundle]);
+  const expected = { identifier: await readInstalledBundleIdentifier(targetBundle), version };
+  assertBundleMatches(await readBundleInfo(sourceBundle), expected);
+
+  const stamp = uniqueStamp();
+  const staged = hiddenSiblingPath(targetBundle, 'update', stamp);
+  const aside = hiddenSiblingPath(targetBundle, 'previous', stamp);
+
+  try {
+    await bundleFileOps.remove(staged);
+    await bundleFileOps.copyDirectory(sourceBundle, staged);
+    assertBundleMatches(await readBundleInfo(staged), expected);
+
+    if (nativeSignatureVerificationEnabled()) {
+      try {
+        // Ad-hoc signatures still seal every file, so this detects tampering or corruption.
+        await runNativeCommand(CODESIGN_PATH, ['--verify', '--deep', '--strict', staged]);
+      } catch (error) {
+        throw new Error(
+          `The downloaded app failed code signature verification: ${(error as Error).message}`,
+          { cause: error }
+        );
+      }
+    }
+
+    // Only a verified bundle loses its quarantine flag.
+    await runNativeCommand('xattr', ['-dr', 'com.apple.quarantine', staged]);
+    await swapBundleIntoPlace(bundleFileOps, { target: targetBundle, staged, aside });
+    pendingRelaunch = { version, reason: 'update' };
+  } finally {
+    // No-op after a successful swap; removes a partial or rejected stage otherwise.
+    await bundleFileOps.remove(staged).catch(() => {
+      // ignore cleanup failure
+    });
+  }
+
+  await preserveRollbackBackup(aside, path.basename(targetBundle));
 }
 
+async function writeFully(handle: FileHandle, chunk: Uint8Array): Promise<void> {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const { bytesWritten } = await handle.write(chunk, offset, chunk.byteLength - offset);
+    offset += bytesWritten;
+  }
+}
+
+/**
+ * Stream `url` to `destinationPath`, hashing and counting bytes as they arrive.
+ * With `expected`, the file only appears at `destinationPath` when its size and
+ * SHA-256 match; otherwise this throws and the partial file is removed.
+ */
 export async function downloadFile(
   url: string,
   destinationPath: string,
-  onProgress: (downloadedBytes: number, totalBytes: number) => void
-) {
+  onProgress: (downloadedBytes: number, totalBytes: number) => void,
+  expected?: ExpectedDownload
+): Promise<DownloadDigest> {
   if (integrationEnvironment) assertLoopbackUrl(url);
   assertIntegrationPath(destinationPath);
   const response = await fetch(url, {
@@ -526,208 +739,82 @@ export async function downloadFile(
     throw new Error(`Failed to download update: ${String(response.status)} ${response.statusText}`);
   }
 
-  const totalBytes = Number.parseInt(response.headers.get('content-length') ?? '0', 10) || 0;
+  const totalBytes =
+    expected?.size ?? (Number.parseInt(response.headers.get('content-length') ?? '0', 10) || 0);
+  const partialPath = `${destinationPath}.partial-${randomBytes(4).toString('hex')}`;
+  assertIntegrationPath(partialPath);
+  const verifier = new DownloadVerifier(expected);
   const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let downloadedBytes = 0;
+  let handle: FileHandle | undefined;
+  let completed = false;
 
-  for (;;) {
-    const nextChunk = await reader.read();
-    if (nextChunk.done) break;
+  try {
+    handle = await fs.open(partialPath, 'wx', 0o600);
+    for (;;) {
+      const nextChunk = await reader.read();
+      if (nextChunk.done) break;
 
-    const value = nextChunk.value;
-    chunks.push(value);
-    downloadedBytes += value.byteLength;
-    onProgress(downloadedBytes, totalBytes);
-  }
-
-  assertIntegrationPath(destinationPath);
-  await fs.writeFile(destinationPath, Buffer.concat(chunks));
-}
-
-async function checkForMacUpdate() {
-  dispatchUpdaterEvent({ type: 'check-started' });
-  dispatchUpdaterEvent({ type: 'check-started' });
-
-  const updatesAllowed = integrationEnvironment
-    ? Boolean(integrationEnvironment.updater)
-    : app.isPackaged || getRuntimeConfig().devUpdaterEnabled;
-
-  if (!updatesAllowed) {
-    await logInfo('updater', 'Skipping updater in development mode');
-    // use 'message' event (already in reducer) for simple text updates
-    dispatchUpdaterEvent({
-      type: 'message',
-      message: 'Update checks are disabled in development mode. Set GTV_UPDATER_DEV=1 to test.',
-    });
-    return;
-  }
-
-  if (process.platform !== 'darwin' && !integrationEnvironment?.updater) {
-    // use 'message' event for simple text-only status updates
-    dispatchUpdaterEvent({
-      type: 'message',
-      message: `Updates are not configured for ${process.platform}.`,
-    });
-    return;
-  }
-
-  const release = await requestJson<ReleasePayload>(
-    integrationEnvironment?.updater?.releaseApiUrl ??
-      `https://api.github.com/repos/${RELEASE_OWNER}/${RELEASE_REPO}/releases/latest`
-  );
-
-  const latestVersion = normalizeVersion(release.tag_name);
-  const currentVersion = normalizeVersion(updaterVersion());
-
-  if (compareVersions(latestVersion, currentVersion) <= 0) {
-    cachedRelease = undefined;
-    cachedAsset = undefined;
-    dispatchUpdaterEvent({
-      type: 'check-completed-no-update',
-      latestVersion,
-      lastCheckedAt: updaterStatus.lastCheckedAt ?? new Date().toISOString(),
-      message: `You're up to date (${currentVersion}).`,
-    });
-    return;
-  }
-
-  const state = await readUpdateState();
-  if (state.skippedVersion && normalizeVersion(state.skippedVersion) === latestVersion) {
-    cachedRelease = undefined;
-    cachedAsset = undefined;
-    dispatchUpdaterEvent({
-      type: 'check-completed-no-update',
-      latestVersion,
-      lastCheckedAt: updaterStatus.lastCheckedAt ?? new Date().toISOString(),
-      message: `Update ${latestVersion} was skipped.`,
-    });
-    return;
-  }
-
-  const selectedAsset = findBestMacAsset(release.assets);
-  if (!selectedAsset) {
-    cachedRelease = undefined;
-    cachedAsset = undefined;
-    dispatchUpdaterEvent({
-      type: 'check-completed-no-asset',
-      latestVersion,
-      message: `Release ${latestVersion} has no compatible macOS asset.`,
-    });
-    return;
-  }
-
-  cachedRelease = release;
-  cachedAsset = selectedAsset;
-  dispatchUpdaterEvent({
-    type: 'check-completed-update-available',
-    latestVersion,
-    lastCheckedAt: new Date().toISOString(),
-    installable: true,
-    message: `Update ${latestVersion} is available.`,
-  });
-}
-
-export async function checkForUpdatesInBackground() {
-  if (activeBackgroundCheck) {
-    await activeBackgroundCheck;
-    return await getUpdaterStatus();
-  }
-
-  const lastCheckedAt = updaterStatus.lastCheckedAt
-    ? Date.parse(updaterStatus.lastCheckedAt)
-    : Number.NaN;
-  const shouldDebounce =
-    Number.isFinite(lastCheckedAt) && Date.now() - lastCheckedAt < BACKGROUND_CHECK_DEBOUNCE_MS;
-
-  if (shouldDebounce) {
-    return await getUpdaterStatus();
-  }
-
-  activeBackgroundCheck = (async () => {
-    try {
-      await checkForMacUpdate();
-    } catch (error) {
-      await logError('updater', 'Update check failed', error);
-      dispatchUpdaterEvent({
-        type: 'check-failed',
-        message: (error as Error).message || 'Update check failed. See logs for details.',
-      });
+      verifier.update(nextChunk.value);
+      await writeFully(handle, nextChunk.value);
+      onProgress(verifier.receivedBytes, totalBytes);
     }
-  })();
+    await handle.close();
+    handle = undefined;
 
-  try {
-    await activeBackgroundCheck;
-  } finally {
-    activeBackgroundCheck = undefined;
-  }
-
-  return await getUpdaterStatus();
-}
-
-export async function checkForUpdatesManually() {
-  if (activeBackgroundCheck) {
-    await activeBackgroundCheck;
-  }
-
-  try {
-    await checkForMacUpdate();
+    const digest = verifier.finish();
+    assertIntegrationPath(destinationPath);
+    await fs.rename(partialPath, destinationPath);
+    completed = true;
+    return digest;
   } catch (error) {
-    await logError('updater', 'Update check failed', error);
-    // check-failed event (already in reducer since /6d)
-    dispatchUpdaterEvent({
-      type: 'check-failed',
-      message: (error as Error).message || 'Update check failed. See logs for details.',
-    });
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+    if (!completed) {
+      await fs.rm(partialPath, { force: true }).catch(() => undefined);
+    }
   }
-
-  return await getUpdaterStatus();
 }
 
-export async function installAvailableUpdate() {
-  const installDevModeOverride =
-    !integrationEnvironment && getRuntimeConfig().devUpdaterEnabled && !app.isPackaged;
-
-  if (!cachedRelease || !cachedAsset || !updaterStatus.latestVersion) {
-    dispatchUpdaterEvent({
-      type: 'check-failed',
-      message: 'No installable update is currently available.',
-    });
-    return await getUpdaterStatus();
+/** Size and digest the download must match; refuses assets GitHub has not hashed. */
+function expectedDownloadFor(asset: ReleaseAsset): ExpectedDownload {
+  const sha256 = parseSha256Digest(asset.digest);
+  if (!sha256) {
+    throw new UpdaterUserError(
+      `The release file ${asset.name} has no SHA-256 digest, so the download can't be verified. Download the update from the releases page instead.`
+    );
   }
-
-  // Guard against re-entry — the renderer polls and could fire install twice.
-  if (updaterStatus.inProgress) {
-    return await getUpdaterStatus();
+  if (!Number.isSafeInteger(asset.size) || asset.size <= 0) {
+    throw new UpdaterUserError(
+      `The release file ${asset.name} does not report a valid size, so the download can't be verified. Download the update from the releases page instead.`
+    );
   }
+  return { size: asset.size, sha256 };
+}
 
-  const version = updaterStatus.latestVersion;
+function safeArchiveName(name: string): string {
+  const base = path.basename(name).replace(/[^\w.\- ]/g, '_');
+  return base && !/^\.+$/.test(base) ? base : 'update.zip';
+}
 
-  if (isDmgAsset(cachedAsset)) {
-    if (integrationEnvironment) {
-      assertLoopbackUrl(cachedAsset.browser_download_url);
-      await runNativeCommand('open', [cachedAsset.browser_download_url]);
-    } else {
-      await shell.openExternal(cachedAsset.browser_download_url);
-    }
-    await showUpdaterDialog({
-      type: 'info',
-      buttons: ['OK'],
-      defaultId: 0,
-      title: 'Manual install',
-      message: 'DMG opened in your browser.',
-      detail:
-        'Open the DMG, drag the app to Applications, then if macOS blocks launch use Privacy & Security > Open Anyway.',
-    });
-    return await getUpdaterStatus();
-  }
+async function createUpdateWorkDirectory(): Promise<string> {
+  const directory = await fs.mkdtemp(path.join(updaterTemporaryDirectory(), 'gtv-update-'));
+  assertIntegrationPath(directory);
+  return directory;
+}
 
-  const tmpZipPath = path.join(
-    updaterTemporaryDirectory(),
-    integrationEnvironment ? path.basename(cachedAsset.name) : cachedAsset.name
-  );
-
+async function downloadAndInstall(
+  asset: ReleaseAsset,
+  version: string,
+  targetBundle: string,
+  devModeOverride: boolean
+) {
+  const expected = expectedDownloadFor(asset);
+  const workDir = await createUpdateWorkDirectory();
   try {
+    const zipPath = path.join(workDir, safeArchiveName(asset.name));
+
     dispatchUpdaterEvent({
       type: 'download-started',
       latestVersion: version,
@@ -736,8 +823,8 @@ export async function installAvailableUpdate() {
 
     const downloadStartTime = Date.now();
     await downloadFile(
-      cachedAsset.browser_download_url,
-      tmpZipPath,
+      asset.browser_download_url,
+      zipPath,
       (downloadedBytes, totalBytes) => {
         const elapsedSeconds = Math.max(1, (Date.now() - downloadStartTime) / 1000);
         const bytesPerSecond = downloadedBytes / elapsedSeconds;
@@ -757,7 +844,8 @@ export async function installAvailableUpdate() {
           progressPercent,
           etaSeconds,
         });
-      }
+      },
+      expected
     );
 
     dispatchUpdaterEvent({
@@ -765,17 +853,243 @@ export async function installAvailableUpdate() {
       message: 'Installing update...',
     });
 
-    await installMacUpdateFromZip(tmpZipPath);
+    await installMacUpdateFromZip({
+      zipPath,
+      unpackDir: path.join(workDir, 'unpack'),
+      targetBundle,
+      version,
+      devModeOverride,
+    });
+  } finally {
+    // Removes the downloaded ZIP and the extracted bundle on every path.
+    await removePathRecursive(workDir).catch(async (error: unknown) => {
+      await logError('updater', 'Failed to remove update work directory', { workDir, error });
+    });
+  }
+}
 
+// ── checks ──────────────────────────────────────────────────────────────────
+
+async function checkForMacUpdate() {
+  dispatchUpdaterEvent({ type: 'check-started' });
+
+  const updatesAllowed = integrationEnvironment
+    ? Boolean(integrationEnvironment.updater)
+    : app.isPackaged || getRuntimeConfig().devUpdaterEnabled;
+
+  if (!updatesAllowed) {
+    await logInfo('updater', 'Skipping updater in development mode');
+    dispatchUpdaterEvent({
+      type: 'message',
+      message: 'Update checks are disabled in development mode. Set GTV_UPDATER_DEV=1 to test.',
+    });
+    return;
+  }
+
+  if (process.platform !== 'darwin' && !integrationEnvironment?.updater) {
+    dispatchUpdaterEvent({
+      type: 'message',
+      message: `Updates are not configured for ${process.platform}.`,
+    });
+    return;
+  }
+
+  const release = await requestJson<unknown>(
+    integrationEnvironment?.updater?.releaseApiUrl ?? latestReleaseApiUrl()
+  );
+  assertReleasePayload(release);
+
+  const latestVersion = normalizeVersion(release.tag_name);
+  const currentVersion = normalizeVersion(updaterVersion());
+  // Every completed path records the check time (used for display and debounce).
+  const lastCheckedAt = new Date().toISOString();
+
+  if (compareVersions(latestVersion, currentVersion) <= 0) {
+    cachedRelease = undefined;
+    cachedAsset = undefined;
+    dispatchUpdaterEvent({
+      type: 'check-completed-no-update',
+      latestVersion,
+      lastCheckedAt,
+      message: `You're up to date (${currentVersion}).`,
+    });
+    return;
+  }
+
+  const state = await readUpdateState();
+  if (state.skippedVersion && normalizeVersion(state.skippedVersion) === latestVersion) {
+    cachedRelease = undefined;
+    cachedAsset = undefined;
+    dispatchUpdaterEvent({
+      type: 'check-completed-no-update',
+      latestVersion,
+      lastCheckedAt,
+      message: `Update ${latestVersion} was skipped.`,
+    });
+    return;
+  }
+
+  const selectedAsset = findBestMacAsset(release.assets);
+  if (!selectedAsset) {
+    cachedRelease = undefined;
+    cachedAsset = undefined;
+    dispatchUpdaterEvent({
+      type: 'check-completed-no-asset',
+      latestVersion,
+      lastCheckedAt,
+      message: `Release ${latestVersion} has no compatible macOS asset.`,
+    });
+    return;
+  }
+
+  cachedRelease = release;
+  cachedAsset = selectedAsset;
+  dispatchUpdaterEvent({
+    type: 'check-completed-update-available',
+    latestVersion,
+    lastCheckedAt,
+    installable: true,
+    message: `Update ${latestVersion} is available.`,
+  });
+}
+
+/** Runs one check, shared by every caller that arrives while it is in flight. Never rejects. */
+function runCheck(): Promise<void> {
+  activeCheck ??= (async () => {
+    try {
+      await checkForMacUpdate();
+      lastCheckAttempt = { at: Date.now(), ok: true };
+    } catch (error) {
+      lastCheckAttempt = {
+        at: Date.now(),
+        ok: false,
+        ...(error instanceof GitHubRateLimitError && error.retryNotBefore !== undefined
+          ? { retryNotBefore: error.retryNotBefore }
+          : {}),
+      };
+      dispatchUpdaterEvent({
+        type: 'check-failed',
+        message: (error as Error).message || 'Update check failed. See logs for details.',
+      });
+      await logError('updater', 'Update check failed', error).catch(() => undefined);
+    } finally {
+      activeCheck = undefined;
+    }
+  })();
+  return activeCheck;
+}
+
+/**
+ * Checks must not run while a download/install/rollback is in flight (their
+ * events would clear `inProgress` and re-enable install mid-operation), nor
+ * after the bundle was replaced but the app has not relaunched (the running
+ * version would make the just-installed release look new again).
+ */
+function checksSuspended(): boolean {
+  return activeOperation !== undefined || pendingRelaunch !== undefined;
+}
+
+export async function checkForUpdatesInBackground() {
+  if (checksSuspended()) {
+    return await getUpdaterStatus();
+  }
+
+  if (!activeCheck && !shouldRunBackgroundCheck(lastCheckAttempt, Date.now())) {
+    return await getUpdaterStatus();
+  }
+
+  await runCheck();
+  return await getUpdaterStatus();
+}
+
+export async function checkForUpdatesManually() {
+  if (checksSuspended()) {
+    return await getUpdaterStatus();
+  }
+
+  await runCheck();
+  return await getUpdaterStatus();
+}
+
+// ── operations ──────────────────────────────────────────────────────────────
+
+function startOperation(
+  kind: UpdaterOperation['kind'],
+  run: () => Promise<UpdaterStatus>
+): Promise<UpdaterStatus> {
+  const promise = (async () => {
+    try {
+      return await run();
+    } finally {
+      activeOperation = undefined;
+    }
+  })();
+  activeOperation = { kind, promise };
+  return promise;
+}
+
+/** Status for the end of an operation; the rollback folder is quiescent here. */
+async function settledStatus(): Promise<UpdaterStatus> {
+  await syncRollbackStatus();
+  return snapshotUpdaterStatus();
+}
+
+async function performInstall(): Promise<UpdaterStatus> {
+  // A check that was already running must finish before its result is used.
+  if (activeCheck) await activeCheck;
+  if (pendingRelaunch) return snapshotUpdaterStatus();
+
+  const asset = cachedAsset;
+  const version = updaterStatus.latestVersion;
+  if (!cachedRelease || !asset || !version) {
+    dispatchUpdaterEvent({
+      type: 'check-failed',
+      message: 'No installable update is currently available.',
+    });
+    return await settledStatus();
+  }
+
+  if (isDmgAsset(asset)) {
+    if (integrationEnvironment) {
+      assertLoopbackUrl(asset.browser_download_url);
+      await runNativeCommand('open', [asset.browser_download_url]);
+    } else {
+      await shell.openExternal(asset.browser_download_url);
+    }
+    await showUpdaterDialog({
+      type: 'info',
+      buttons: ['OK'],
+      defaultId: 0,
+      title: 'Manual install',
+      message: 'DMG opened in your browser.',
+      detail:
+        'Open the DMG, drag the app to Applications, then if macOS blocks launch use Privacy & Security > Open Anyway.',
+    });
+    return await settledStatus();
+  }
+
+  const devModeOverride = isDevModeOverride();
+  const targetBundle = getBundlePathFromExecPath();
+
+  try {
+    if (!devModeOverride) {
+      // Fail before downloading anything, and before touching the rollback backup.
+      await assertInstallLocationWritable(targetBundle, canWrite);
+    }
+
+    await downloadAndInstall(asset, version, targetBundle, devModeOverride);
+
+    cachedRelease = undefined;
+    cachedAsset = undefined;
     dispatchUpdaterEvent({
       type: 'install-completed',
       latestVersion: version,
-      message: installDevModeOverride
-        ? 'Dev mode: install step skipped.'
-        : `Update ${version} installed.`,
+      ...(devModeOverride
+        ? { message: 'Dev mode: install step skipped.' }
+        : { relaunchRequired: true }),
     });
 
-    if (installDevModeOverride) {
+    if (devModeOverride) {
       await showUpdaterDialog({
         type: 'info',
         buttons: ['OK'],
@@ -784,7 +1098,7 @@ export async function installAvailableUpdate() {
         message: 'Download/install flow completed in dev mode.',
         detail: 'Relaunch is skipped in development override mode.',
       });
-      return await getUpdaterStatus();
+      return await settledStatus();
     }
 
     const relaunchChoice = await showUpdaterDialog({
@@ -801,12 +1115,15 @@ export async function installAvailableUpdate() {
       relaunchUpdatedApp();
     }
   } catch (error) {
-    await logError('updater', 'Automatic update installation failed', error);
+    await logError('updater', 'Automatic update installation failed', error).catch(() => undefined);
     cachedRelease = undefined;
     cachedAsset = undefined;
     dispatchUpdaterEvent({
       type: 'install-failed',
-      message: `Update ${version} failed during download or install. Please try again.`,
+      message:
+        error instanceof UpdaterUserError
+          ? error.message
+          : `Update ${version} failed during download or install. Please try again.`,
     });
     await showUpdaterDialog({
       type: 'warning',
@@ -816,33 +1133,67 @@ export async function installAvailableUpdate() {
       message: `Update ${version} could not be installed.`,
       detail: (error as Error).message || 'See logs for details.',
     });
+  }
+
+  return await settledStatus();
+}
+
+export async function installAvailableUpdate(): Promise<UpdaterStatus> {
+  if (activeOperation) {
+    // A second click joins the running install instead of racing it.
+    return activeOperation.kind === 'install'
+      ? await activeOperation.promise
+      : await getUpdaterStatus();
+  }
+  if (pendingRelaunch) {
+    return await getUpdaterStatus();
+  }
+  return await startOperation('install', performInstall);
+}
+
+/** Swap the rollback backup into place using the same staged rename as an install. */
+async function restoreRollbackBundle(rollbackBundlePath: string, targetBundle: string) {
+  await assertInstallLocationWritable(targetBundle, canWrite);
+  const identifier = await readInstalledBundleIdentifier(targetBundle);
+  assertBundleMatches(await readBundleInfoOrEmpty(rollbackBundlePath), { identifier }, 'Backup');
+
+  const stamp = uniqueStamp();
+  const staged = hiddenSiblingPath(targetBundle, 'rollback', stamp);
+  const aside = hiddenSiblingPath(targetBundle, 'previous', stamp);
+
+  try {
+    await bundleFileOps.remove(staged);
+    // Copy, so the backup survives if anything below fails.
+    await bundleFileOps.copyDirectory(rollbackBundlePath, staged);
+    await runNativeCommand('xattr', ['-dr', 'com.apple.quarantine', staged]);
+    await swapBundleIntoPlace(bundleFileOps, { target: targetBundle, staged, aside });
   } finally {
-    await fs.rm(tmpZipPath, { force: true }).catch(() => {
+    await bundleFileOps.remove(staged).catch(() => {
       // ignore cleanup failure
     });
   }
 
-  return await getUpdaterStatus();
+  await bundleFileOps.remove(aside).catch(async (error: unknown) => {
+    await logError('updater', 'Failed to remove replaced bundle after rollback', {
+      aside,
+      error,
+    });
+  });
 }
 
-export async function rollbackToPreviousVersion() {
-  if (updaterStatus.inProgress) {
-    dispatchUpdaterEvent({
-      type: 'message',
-      message: 'Cannot roll back while another update operation is in progress.',
-    });
-    return await getUpdaterStatus();
-  }
+async function performRollback(): Promise<UpdaterStatus> {
+  if (activeCheck) await activeCheck;
 
   const state = await syncRollbackStatus();
   const rollbackBundlePath = getRollbackBundlePath(state);
+  const rollbackVersion = state.rollbackVersion;
 
-  if (!state.rollbackVersion || !rollbackBundlePath || !(await rollbackBundleExists(state))) {
+  if (!rollbackVersion || !rollbackBundlePath || !(await rollbackBundleExists(state))) {
     dispatchUpdaterEvent({
       type: 'rollback-unavailable',
       message: 'No previous version backup is available.',
     });
-    return await getUpdaterStatus();
+    return snapshotUpdaterStatus();
   }
 
   const choice = await showUpdaterDialog({
@@ -851,33 +1202,31 @@ export async function rollbackToPreviousVersion() {
     defaultId: 0,
     cancelId: 1,
     title: 'Rollback available',
-    message: `Roll back to version ${state.rollbackVersion}?`,
+    message: `Roll back to version ${rollbackVersion}?`,
     detail:
       'The current app bundle will be replaced with the previous version saved before the last in-app update.',
   });
 
   if (choice.response === 1) {
-    return await getUpdaterStatus();
+    return await settledStatus();
   }
 
   const targetBundle = getBundlePathFromExecPath();
+  const devModeOverride = isDevModeOverride();
 
   try {
     dispatchUpdaterEvent({
       type: 'rollback-started',
-      targetVersion: state.rollbackVersion,
-      message: `Rolling back to ${state.rollbackVersion}...`,
+      targetVersion: rollbackVersion,
+      message: `Rolling back to ${rollbackVersion}...`,
       progressPercent: 20,
     });
 
     await logInfo('updater', 'Restoring rollback backup', {
       rollbackBundlePath,
       targetBundle,
-      rollbackVersion: state.rollbackVersion,
+      rollbackVersion,
     });
-
-    const devModeOverride =
-      !integrationEnvironment && getRuntimeConfig().devUpdaterEnabled && !app.isPackaged;
 
     if (devModeOverride) {
       await logInfo('updater', 'Dev mode rollback restore skipped', {
@@ -885,55 +1234,92 @@ export async function rollbackToPreviousVersion() {
         targetBundle,
       });
     } else {
-      await runNativeCommand('ditto', [rollbackBundlePath, targetBundle]);
-      await runNativeCommand('xattr', ['-dr', 'com.apple.quarantine', targetBundle]);
-    }
-
-    await clearRollbackBackup(state);
-    dispatchUpdaterEvent({
-      type: 'rollback-completed',
-      message: devModeOverride
-        ? 'Dev mode: rollback restore skipped.'
-        : `Rolled back to ${state.rollbackVersion}.`,
-    });
-
-    if (devModeOverride) {
-      await showUpdaterDialog({
-        type: 'info',
-        buttons: ['OK'],
-        defaultId: 0,
-        title: 'Dev rollback test',
-        message: 'Rollback flow completed in dev mode.',
-        detail: 'Restore and relaunch are skipped in development override mode.',
-      });
-      return await getUpdaterStatus();
-    }
-
-    const relaunchChoice = await showUpdaterDialog({
-      type: 'info',
-      buttons: ['Relaunch now', 'Later'],
-      defaultId: 0,
-      cancelId: 1,
-      title: 'Rollback complete',
-      message: `Version ${state.rollbackVersion} was restored.`,
-      detail: 'Relaunch to start the restored app.',
-    });
-
-    if (relaunchChoice.response === 0) {
-      relaunchUpdatedApp();
+      await restoreRollbackBundle(rollbackBundlePath, targetBundle);
+      pendingRelaunch = { version: rollbackVersion, reason: 'rollback' };
     }
   } catch (error) {
-    await logError('updater', 'Rollback failed', error);
+    await logError('updater', 'Rollback failed', error).catch(() => undefined);
     dispatchUpdaterEvent({
       type: 'rollback-failed',
-      message: 'Rollback failed while restoring the previous version.',
+      message:
+        error instanceof UpdaterUserError
+          ? `Rollback failed. ${error.message}`
+          : 'Rollback failed while restoring the previous version.',
     });
+    return await settledStatus();
   }
 
-  return await getUpdaterStatus();
+  // The previous version is back in place; a stale backup must not block that.
+  await clearRollbackBackup(state).catch(async (error: unknown) => {
+    await logError('updater', 'Failed to clear rollback backup after restore', error);
+  });
+  dispatchUpdaterEvent({
+    type: 'rollback-completed',
+    restoredVersion: rollbackVersion,
+    ...(devModeOverride
+      ? { message: 'Dev mode: rollback restore skipped.' }
+      : { relaunchRequired: true }),
+  });
+
+  if (devModeOverride) {
+    await showUpdaterDialog({
+      type: 'info',
+      buttons: ['OK'],
+      defaultId: 0,
+      title: 'Dev rollback test',
+      message: 'Rollback flow completed in dev mode.',
+      detail: 'Restore and relaunch are skipped in development override mode.',
+    });
+    return await settledStatus();
+  }
+
+  const relaunchChoice = await showUpdaterDialog({
+    type: 'info',
+    buttons: ['Relaunch now', 'Later'],
+    defaultId: 0,
+    cancelId: 1,
+    title: 'Rollback complete',
+    message: `Version ${rollbackVersion} was restored.`,
+    detail: 'Relaunch to start the restored app.',
+  });
+
+  if (relaunchChoice.response === 0) {
+    relaunchUpdatedApp();
+  }
+
+  return await settledStatus();
+}
+
+export async function rollbackToPreviousVersion(): Promise<UpdaterStatus> {
+  if (activeOperation) {
+    return activeOperation.kind === 'rollback'
+      ? await activeOperation.promise
+      : await getUpdaterStatus();
+  }
+  // After a rollback the backup is gone; rolling back an update that is
+  // waiting for relaunch is still allowed (it restores the running version).
+  if (pendingRelaunch?.reason === 'rollback') {
+    return await getUpdaterStatus();
+  }
+  return await startOperation('rollback', performRollback);
+}
+
+/**
+ * Relaunch into the bundle that an update or rollback installed. Returns
+ * `false` (and does nothing) when no relaunch is pending. Intended for the
+ * tray "Check for Updates…" flow when `status.relaunchRequired` is set.
+ */
+export function relaunchToFinishUpdate(): boolean {
+  if (!pendingRelaunch) return false;
+  relaunchUpdatedApp();
+  return true;
 }
 
 export async function getUpdaterStatus(): Promise<UpdaterStatus> {
-  await syncRollbackStatus();
-  return { ...updaterStatus, currentVersion: updaterVersion() };
+  // The rollback folder is being rewritten during an operation; report the
+  // in-memory status rather than racing it.
+  if (!activeOperation) {
+    await syncRollbackStatus();
+  }
+  return snapshotUpdaterStatus();
 }

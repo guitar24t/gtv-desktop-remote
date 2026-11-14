@@ -16,8 +16,10 @@
  *   └─────────────┴──────────────────────────────┘
  *
  * The varint is little-endian, 7 bits per byte, high bit set to indicate
- * "more bytes follow". The protocol only uses 32-bit varints (max 5 bytes),
- * so we cap `shift` at 28 to catch malformed input.
+ * "more bytes follow". The protocol only uses 32-bit varints, so a header
+ * longer than 5 bytes is malformed. Bodies larger than `MAX_FRAME_BODY_BYTES`
+ * are rejected so a hostile or corrupt length cannot make the caller buffer
+ * without bound.
  *
  * Behavior parity with the previous inline parser is asserted by tests in
  * `__tests__/frameParser.test.ts`.
@@ -30,20 +32,29 @@ export interface FrameParseResult {
   /** The trailing bytes that did not form a complete frame yet. Must be
    * prepended to the next chunk received from the socket. */
   readonly remaining: Buffer;
-  /** Set iff the parser detected a malformed varint header (too many
-   * continuation bits). Caller MUST drop the connection — the stream is
-   * unrecoverable. The parser also clears `remaining` to empty in this case. */
+  /** Set iff the parser detected a malformed varint header (more than 5
+   * bytes) or a frame body larger than `MAX_FRAME_BODY_BYTES`. Caller MUST
+   * drop the connection — the stream is unrecoverable. The parser also clears
+   * `remaining` to empty in this case. */
   readonly error?: Error;
 }
 
-/** Maximum number of bits in a 32-bit varint header (5 * 7 = 35; we cap at 28
- * because the 5th byte may only contribute 4 bits but the parser treats it
- * the same as the previous inline implementation: `shift > 28` → error). */
+/** Shift of the last (5th) byte a 32-bit varint header may have. A 5th byte
+ * that still has its continuation bit set makes the header malformed. */
 const MAX_VARINT_SHIFT_BITS = 28;
+
+/** Longest accepted varint header, in bytes. */
+const MAX_VARINT_BYTES = 5;
+
+/** Largest accepted frame body. Real remote messages are a few KiB at most
+ * (voice payloads are ~20 KiB). */
+const MAX_FRAME_BODY_BYTES = 1024 * 1024;
 
 /** Sentinel for a malformed varint header. Matches the message the previous
  * inline parser used so error logs and pollinator tests are unchanged. */
 const MALFORMED_FRAME_ERROR_MESSAGE = 'Received an invalid remote protocol frame.';
+
+const FRAME_TOO_LARGE_ERROR_MESSAGE = 'Received an oversized remote protocol frame.';
 
 /**
  * Decode all complete frames sitting in `buffer`. Returns the assembled
@@ -99,30 +110,31 @@ type HeaderDecode =
  */
 function decodeVarintHeader(buffer: Buffer, start: number): HeaderDecode {
   let length = 0;
-  let shift = 0;
 
-  for (let index = start; index < buffer.length; index += 1) {
-    const byte = buffer[index];
+  for (let index = 0; index < MAX_VARINT_BYTES; index += 1) {
+    const byte = buffer[start + index];
     if (byte === undefined) {
-      // Defensive: should be unreachable because index < buffer.length.
       return { kind: 'need-more' };
     }
-    length |= (byte & 0x7f) << shift;
-
-    if ((byte & 0x80) === 0) {
-      return { kind: 'ok', headerLength: index - start + 1, bodyLength: length };
+    // Multiply instead of `<<`: bitwise shifts are 32-bit signed, so the 5th
+    // byte (shift 28) would overflow into a negative length.
+    length += (byte & 0x7f) * 2 ** (index * 7);
+    if (length > MAX_FRAME_BODY_BYTES) {
+      return { kind: 'error', error: new Error(FRAME_TOO_LARGE_ERROR_MESSAGE) };
     }
 
-    shift += 7;
-    if (shift > MAX_VARINT_SHIFT_BITS) {
-      return { kind: 'error', error: new Error(MALFORMED_FRAME_ERROR_MESSAGE) };
+    if ((byte & 0x80) === 0) {
+      return { kind: 'ok', headerLength: index + 1, bodyLength: length };
     }
   }
 
-  return { kind: 'need-more' };
+  return { kind: 'error', error: new Error(MALFORMED_FRAME_ERROR_MESSAGE) };
 }
 
 export const __TEST__ = {
+  FRAME_TOO_LARGE_ERROR_MESSAGE,
   MALFORMED_FRAME_ERROR_MESSAGE,
+  MAX_FRAME_BODY_BYTES,
+  MAX_VARINT_BYTES,
   MAX_VARINT_SHIFT_BITS,
 };

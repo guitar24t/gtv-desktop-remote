@@ -54,6 +54,13 @@ export class PreferencesController {
   private queue: Promise<unknown> = Promise.resolve();
   private capturePaused = false;
   private captureShortcut: string | null = null;
+  /** Login state as last written to disk (a missing file means the default, off). */
+  private persistedLaunchAtLogin: boolean | null = false;
+  /**
+   * The saved file exists but could not be parsed. Background readback must not
+   * overwrite it with defaults; only an explicit user save may replace it.
+   */
+  private storeUnreadable = false;
 
   constructor(
     private readonly fs: IFileSystem,
@@ -86,8 +93,13 @@ export class PreferencesController {
         ) {
           this.state.shortcut = normalizeShortcut(data.shortcut);
         }
+        if (data && typeof data === 'object' && 'launchAtLogin' in data) {
+          const saved = data.launchAtLogin;
+          if (typeof saved === 'boolean' || saved === null) this.persistedLaunchAtLogin = saved;
+        }
       }
     } catch {
+      this.storeUnreadable = true;
       this.state.shortcutError =
         'Saved preferences could not be read. The default shortcut will be used; save a shortcut to repair preferences.';
     }
@@ -109,10 +121,11 @@ export class PreferencesController {
   refresh(): Promise<AppPreferences> {
     const operation = this.queue.then(async () => {
       if (this.platform.loginSupported) {
-        const previous = this.state.launchAtLogin;
         try {
           const actual = this.readLogin();
-          if (actual !== previous) await this.persist(this.state.shortcut, actual);
+          if (actual !== this.persistedLaunchAtLogin && !this.storeUnreadable) {
+            await this.persist(this.state.shortcut, actual);
+          }
         } catch (error) {
           this.state.launchAtLoginError ??=
             error instanceof Error
@@ -191,6 +204,8 @@ export class PreferencesController {
       'utf8'
     );
     await this.fs.rename(temporary, this.storePath);
+    this.persistedLaunchAtLogin = launchAtLogin;
+    this.storeUnreadable = false;
   }
 
   private nativeShortcutIdentity(shortcut: string): string {

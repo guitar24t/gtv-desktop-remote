@@ -12,7 +12,6 @@ import {
 const TARGET: VoiceSessionTarget = {
   deviceId: 'dev-1',
   host: '192.168.1.42',
-  macAddress: 'aa:bb:cc:dd:ee:ff',
 };
 
 interface TransportCall {
@@ -20,7 +19,7 @@ interface TransportCall {
   host: string;
   sessionId?: number;
   chunkLength?: number;
-  macAddress?: string;
+  deviceId?: string;
 }
 
 interface LogEntry {
@@ -29,32 +28,32 @@ interface LogEntry {
   details?: Record<string, unknown>;
 }
 
-function makeFakes(opts: { startSessionId?: number; pending?: boolean } = {}) {
+function makeFakes(opts: { startSessionId?: number; pending?: boolean; stopError?: Error } = {}) {
   const transportCalls: TransportCall[] = [];
   const logs: LogEntry[] = [];
   let timeNow = 1_000_000;
 
   const transport: IVoiceTransport = {
-    start: (host, macAddress) => {
-      transportCalls.push({ op: 'start', host, macAddress });
+    start: (host, deviceId) => {
+      transportCalls.push({ op: 'start', host, deviceId });
       return Promise.resolve(opts.startSessionId ?? 42);
     },
-    sendChunk: (host, sessionId, chunk, macAddress) => {
+    sendChunk: (host, sessionId, chunk, deviceId) => {
       transportCalls.push({
         op: 'sendChunk',
         host,
         sessionId,
         chunkLength: chunk.length,
-        macAddress,
+        deviceId,
       });
       return Promise.resolve();
     },
-    stop: (host, sessionId, macAddress) => {
-      transportCalls.push({ op: 'stop', host, sessionId, macAddress });
-      return Promise.resolve();
+    stop: (host, sessionId, deviceId) => {
+      transportCalls.push({ op: 'stop', host, sessionId, deviceId });
+      return opts.stopError ? Promise.reject(opts.stopError) : Promise.resolve();
     },
-    hasPending: (host, macAddress) => {
-      transportCalls.push({ op: 'hasPending', host, macAddress });
+    hasPending: (host, deviceId) => {
+      transportCalls.push({ op: 'hasPending', host, deviceId });
       return Promise.resolve(opts.pending ?? false);
     },
   };
@@ -96,7 +95,7 @@ describe('VoiceSessionService.start', () => {
     const id = await svc.start(TARGET);
     expect(id).toBe(7);
     expect(fakes.transportCalls).toEqual([
-      { op: 'start', host: TARGET.host, macAddress: TARGET.macAddress },
+      { op: 'start', host: TARGET.host, deviceId: TARGET.deviceId },
     ]);
     expect(fakes.logs[0]).toMatchObject({
       scope: 'adapter',
@@ -122,7 +121,7 @@ describe('VoiceSessionService.sendChunk', () => {
       host: TARGET.host,
       sessionId: id,
       chunkLength: 5,
-      macAddress: TARGET.macAddress,
+      deviceId: TARGET.deviceId,
     });
     expect(fakes.logs).toEqual([]); // no progress log at chunk #1
   });
@@ -194,6 +193,25 @@ describe('VoiceSessionService.stop', () => {
   });
 });
 
+describe('VoiceSessionService.stop — transport failure', () => {
+  it('releases the session stats even when the transport stop throws', async () => {
+    const fakes = makeFakes({ stopError: new Error('Connection has been lost.') });
+    const svc = new VoiceSessionService(fakes.transport, fakes.clock, fakes.logger);
+    const id = await svc.start(TARGET);
+    await svc.sendChunk(TARGET, id, Buffer.from('aa').toString('base64'));
+
+    await expect(svc.stop(TARGET, id)).rejects.toThrow('Connection has been lost.');
+
+    expect(svc._trackedSessions()).toEqual([]);
+    expect(fakes.transportCalls).toContainEqual({
+      op: 'stop',
+      host: TARGET.host,
+      sessionId: id,
+      deviceId: TARGET.deviceId,
+    });
+  });
+});
+
 describe('VoiceSessionService.hasPending', () => {
   it('forwards to the transport and returns the result', async () => {
     const fakes = makeFakes({ pending: true });
@@ -203,7 +221,7 @@ describe('VoiceSessionService.hasPending', () => {
     expect(fakes.transportCalls).toContainEqual({
       op: 'hasPending',
       host: TARGET.host,
-      macAddress: TARGET.macAddress,
+      deviceId: TARGET.deviceId,
     });
   });
 });
@@ -213,8 +231,8 @@ describe('VoiceSessionService — multiple concurrent sessions', () => {
     const fakes = makeFakes();
     const transport = fakes.transport;
     let next = 100;
-    transport.start = (host, macAddress) => {
-      fakes.transportCalls.push({ op: 'start', host, macAddress });
+    transport.start = (host, deviceId) => {
+      fakes.transportCalls.push({ op: 'start', host, deviceId });
       next += 1;
       return Promise.resolve(next);
     };

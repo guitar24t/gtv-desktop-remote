@@ -26,6 +26,25 @@ export const KEYBOARD_COMMAND_MAP: Partial<Record<string, RemoteCommand>> = {
 };
 
 /**
+ * Commands that may auto-repeat while their key is held: directional
+ * navigation and volume. Every other command toggles or changes screens
+ * (power, play/pause, select, back, home), so a held key must act once.
+ */
+const KEY_REPEAT_COMMANDS = new Set<RemoteCommand>([
+  'up',
+  'down',
+  'left',
+  'right',
+  'volume_up',
+  'volume_down',
+]);
+
+/** True when a held key (a `keydown` with `repeat`) may dispatch `command` again. */
+export function allowsKeyRepeat(command: RemoteCommand): boolean {
+  return KEY_REPEAT_COMMANDS.has(command);
+}
+
+/**
  * Commands that are sensitive to burst/rapid input.
  * These commands will be batched together if repeated rapidly.
  */

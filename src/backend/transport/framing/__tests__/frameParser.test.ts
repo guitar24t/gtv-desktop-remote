@@ -208,3 +208,75 @@ describe('parseFramedBuffer — caller usage simulation', () => {
     }
   });
 });
+
+describe('parseFramedBuffer — varint bounds (5th byte, oversize, cursor safety)', () => {
+  it('decodes a 3-byte varint header without overflow', () => {
+    const body = Buffer.alloc(20_000, 0x11);
+    const f = frame(body);
+    expect(f.length - body.length).toBe(3);
+    const result = parseFramedBuffer(f);
+    expect(result.error).toBeUndefined();
+    expect(result.frames).toHaveLength(1);
+    expectBuffer(result.frames[0], f);
+  });
+
+  it('a 5-byte varint never decodes to a negative length (oversize error instead)', () => {
+    // 0xff 0xff 0xff 0xff 0x0f = 2^32 - 1; `<< 28` used to make this negative.
+    const result = parseFramedBuffer(Buffer.from([0xff, 0xff, 0xff, 0xff, 0x0f, 0x00]));
+    expect(result.frames).toEqual([]);
+    expect(result.error?.message).toBe(__TEST__.FRAME_TOO_LARGE_ERROR_MESSAGE);
+    expect(result.remaining.length).toBe(0);
+  });
+
+  it('a 5-byte header whose high bits would flip the sign is rejected, not re-delivered', () => {
+    const good = frame(Buffer.from([0x01, 0x02]));
+    const evil = Buffer.from([0x80, 0x80, 0x80, 0x80, 0x08]); // 8 << 28 overflowed to < 0
+    const result = parseFramedBuffer(Buffer.concat([good, evil, good]));
+    expect(result.frames).toHaveLength(1);
+    expectBuffer(result.frames[0], good);
+    expect(result.error?.message).toBe(__TEST__.FRAME_TOO_LARGE_ERROR_MESSAGE);
+  });
+
+  it('accepts a 5-byte header encoding a small length', () => {
+    const header = Buffer.from([0x82, 0x80, 0x80, 0x80, 0x00]); // non-minimal encoding of 2
+    const f = Buffer.concat([header, Buffer.from([0xaa, 0xbb])]);
+    const result = parseFramedBuffer(f);
+    expect(result.error).toBeUndefined();
+    expect(result.frames).toHaveLength(1);
+    expectBuffer(result.frames[0], f);
+  });
+
+  it(`rejects varints longer than ${String(__TEST__.MAX_VARINT_BYTES)} bytes`, () => {
+    const result = parseFramedBuffer(Buffer.from([0x80, 0x80, 0x80, 0x80, 0x80, 0x00]));
+    expect(result.error?.message).toBe(__TEST__.MALFORMED_FRAME_ERROR_MESSAGE);
+    expect(result.remaining.length).toBe(0);
+  });
+
+  it('accepts a body of exactly the maximum frame size', () => {
+    const header = encodeVarint(__TEST__.MAX_FRAME_BODY_BYTES);
+    const result = parseFramedBuffer(header);
+    expect(result.error).toBeUndefined();
+    expect(result.frames).toEqual([]);
+    expect(result.remaining.length).toBe(header.length);
+  });
+
+  it('rejects a declared body larger than the maximum before buffering it', () => {
+    const header = encodeVarint(__TEST__.MAX_FRAME_BODY_BYTES + 1);
+    const result = parseFramedBuffer(header);
+    expect(result.error?.message).toBe(__TEST__.FRAME_TOO_LARGE_ERROR_MESSAGE);
+    expect(result.remaining.length).toBe(0);
+  });
+
+  it('an incomplete 4-byte header waits for more data', () => {
+    const partial = Buffer.from([0x80, 0x80, 0x80, 0x80]);
+    const result = parseFramedBuffer(partial);
+    expect(result.error).toBeUndefined();
+    expect(Buffer.compare(result.remaining, partial)).toBe(0);
+  });
+
+  it('a zero-length body frame still advances the cursor', () => {
+    const result = parseFramedBuffer(Buffer.from([0x00, 0x00, 0x01, 0x7f]));
+    expect(result.frames.map((f) => [...f])).toEqual([[0x00], [0x00], [0x01, 0x7f]]);
+    expect(result.remaining.length).toBe(0);
+  });
+});

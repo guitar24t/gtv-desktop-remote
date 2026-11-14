@@ -43,7 +43,8 @@ test('PAIR-CHECKSUM: rendered checksum failure requests a fresh code and valid r
   await input.fill(h.tv.pairingCode);
   await h.page.getByRole('button', { name: 'Connect', exact: true }).click();
   await h.tv.waitFor((state) => state.ready && state.pairedClients === 1);
-  expect((await h.api('bootstrap')).deviceState.status).toBe('connected');
+  // The TV reports ready before main finishes recording the connection (pin, devices.json).
+  await expect.poll(async () => (await h.api('bootstrap')).deviceState.status).toBe('connected');
   await h.page.getByRole('button', { name: 'Select', exact: true }).click();
   await h.tv.waitFor((state) => state.selected === 1);
 });

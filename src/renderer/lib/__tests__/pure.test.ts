@@ -1,7 +1,13 @@
 /** @vitest-environment jsdom */
 import { describe, expect, it } from 'vitest';
 
-import { classes, isEditableTarget, sanitizePairCode, shouldRestartPairingFlow } from '../pure';
+import {
+  classes,
+  isConnectionUnavailableError,
+  isEditableTarget,
+  sanitizePairCode,
+  shouldRestartPairingFlow,
+} from '../pure';
 
 describe('isEditableTarget (jsdom)', () => {
   it('returns false for null', () => {
@@ -56,6 +62,11 @@ describe('sanitizePairCode', () => {
     expect(sanitizePairCode('')).toBe('');
   });
 
+  it('keeps every hex character of a pasted code with separators', () => {
+    expect(sanitizePairCode('AB12 CD')).toBe('AB12CD');
+    expect(sanitizePairCode('ab-12-cd-ef')).toBe('AB12CD');
+  });
+
   it('returns empty string when all chars are stripped', () => {
     expect(sanitizePairCode('---!!!')).toBe('');
   });
@@ -99,14 +110,36 @@ describe('shouldRestartPairingFlow', () => {
     'PAIRING FAILED', // case-insensitive
     'DecodeError: pairing code failed local certificate hash validation',
     'Server says: invalid pairing code, retry.',
+    'The TV rejected the saved pairing certificate. Start pairing again. If this keeps happening, remove this remote from the TV and pair again.',
   ])('matches: %s', (msg) => {
     expect(shouldRestartPairingFlow(msg)).toBe(true);
   });
 
-  it.each(['', 'Connection timed out', 'Network unreachable', 'TLS handshake error'])(
-    'does not match: %s',
+  it.each([
+    '',
+    'Connection timed out',
+    'Network unreachable',
+    'TLS handshake error',
+    'The device at 192.168.1.20 does not match the paired TV. Rescan for devices, then try again. The saved pairing was kept.',
+  ])('does not match: %s', (msg) => {
+    expect(shouldRestartPairingFlow(msg)).toBe(false);
+  });
+});
+
+describe('isConnectionUnavailableError', () => {
+  it.each([
+    'No active device connected.',
+    'The TV rejected the saved pairing certificate. Start pairing again.',
+    'The device at 10.0.0.5 does not match the paired TV. Rescan for devices, then try again.',
+    'Desktop bridge unavailable. Restart the app after the Electron preload finishes compiling.',
+  ])('drops the rest of the queue after: %s', (msg) => {
+    expect(isConnectionUnavailableError(msg)).toBe(true);
+  });
+
+  it.each(['', 'Could not send up to 10.0.0.5.', 'Connection has been lost.', 'timed out'])(
+    'keeps the queue after a transient error: %s',
     (msg) => {
-      expect(shouldRestartPairingFlow(msg)).toBe(false);
+      expect(isConnectionUnavailableError(msg)).toBe(false);
     }
   );
 });

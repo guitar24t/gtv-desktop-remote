@@ -4,14 +4,20 @@ import path from 'node:path';
 import { app } from 'electron';
 
 import { createSystemClock } from '../../backend/core/clock';
+import { AsyncMutex } from '../../backend/devices/asyncMutex';
 import {
   findExistingForDraft,
+  forgettableLegacyCertKeys,
   identityChanged,
+  legacyCertKeysFor,
   matchSavedToDiscovered,
   mergeIdentity,
   normalizeDraft,
 } from '../../backend/devices/deviceRegistry';
-import { VoiceSessionService } from '../../backend/voice/VoiceSessionService';
+import {
+  VoiceSessionService,
+  type VoiceSessionTarget,
+} from '../../backend/voice/VoiceSessionService';
 import type {
   BootstrapState,
   CommandDispatchRequest,
@@ -28,6 +34,11 @@ import { createNodeLogger, getAppDataPath, logError, logInfo } from '../logger';
 import { commandMetricsStore } from '../metrics';
 
 import { androidTvRemoteBridge } from './androidTvRemote';
+import {
+  CertificateRejectedError,
+  ServerIdentityMismatchError,
+  type DeviceTarget,
+} from './androidTvRemote.types';
 import { discoverGoogleTvDevices } from './discovery';
 import { clearDeviceStore, readDevices, writeDevices } from './store';
 
@@ -43,12 +54,30 @@ function getLegacyUserDataPaths(): string[] {
   return [getAppDataPath(), path.join(appDataRoot, 'GTV Desktop Remote')];
 }
 
+function targetFor(device: SavedDevice, savedDevices: readonly SavedDevice[]): DeviceTarget {
+  return {
+    deviceId: device.id,
+    host: device.host,
+    legacyCertKeys: legacyCertKeysFor(device, savedDevices),
+  };
+}
+
 export class GoogleTvAdapter implements DeviceAdapter {
   private activeDevice: SavedDevice | undefined;
+
+  /** Legacy credential keys computed for `activeDevice` when it connected. */
+  private activeLegacyCertKeys: readonly string[] = [];
 
   private deviceState: DeviceState = DEFAULT_STATE;
 
   private scanPromise: Promise<DiscoveredDevice[]> | undefined;
+
+  /**
+   * Serializes every read-modify-write of devices.json. Network work stays
+   * outside: callers re-read the latest list after it and apply a targeted
+   * update, so a scan's host update and a connect's timestamp both survive.
+   */
+  private readonly storeLock = new AsyncMutex();
 
   private readonly voiceSessions: VoiceSessionService;
 
@@ -57,17 +86,110 @@ export class GoogleTvAdapter implements DeviceAdapter {
       voiceSessions ??
       new VoiceSessionService(
         {
-          start: (host, macAddress) => androidTvRemoteBridge.startAssistantVoice(host, macAddress),
-          sendChunk: (host, sessionId, chunk, macAddress) =>
-            androidTvRemoteBridge.sendAssistantVoiceChunk(host, sessionId, chunk, macAddress),
-          stop: (host, sessionId, macAddress) =>
-            androidTvRemoteBridge.stopAssistantVoice(host, sessionId, macAddress),
-          hasPending: (host, macAddress) =>
-            androidTvRemoteBridge.hasPendingAssistantVoiceSession(host, macAddress),
+          start: (host, deviceId) =>
+            androidTvRemoteBridge.startAssistantVoice({
+              deviceId,
+              host,
+              legacyCertKeys:
+                this.activeDevice?.id === deviceId ? this.activeLegacyCertKeys : undefined,
+            }),
+          sendChunk: (_host, sessionId, chunk, deviceId) =>
+            androidTvRemoteBridge.sendAssistantVoiceChunk(deviceId, sessionId, chunk),
+          stop: (_host, sessionId, deviceId) =>
+            androidTvRemoteBridge.stopAssistantVoice(deviceId, sessionId),
+          hasPending: (_host, deviceId) =>
+            androidTvRemoteBridge.hasPendingAssistantVoiceSession(deviceId),
         },
         createSystemClock(),
         createNodeLogger()
       );
+  }
+
+  /** Runs `task` with the latest saved devices while holding the store lock. */
+  private withDeviceStore<T>(task: (devices: SavedDevice[]) => Promise<T>): Promise<T> {
+    return this.storeLock.runExclusive(async () => task(await readDevices()));
+  }
+
+  /**
+   * Applies `update` to the latest copy of one saved device and persists it.
+   * Returns the updated device, or undefined if it no longer exists.
+   */
+  private updateSavedDevice(
+    deviceId: string,
+    update: (device: SavedDevice) => SavedDevice
+  ): Promise<SavedDevice | undefined> {
+    return this.withDeviceStore(async (devices) => {
+      let updated: SavedDevice | undefined;
+      const nextDevices = devices.map((device) => {
+        if (device.id !== deviceId) return device;
+        updated = update(device);
+        return updated;
+      });
+      if (updated) {
+        await writeDevices(nextDevices);
+      }
+      return updated;
+    });
+  }
+
+  private activeTarget(device: SavedDevice): DeviceTarget {
+    return {
+      deviceId: device.id,
+      host: device.host,
+      legacyCertKeys: this.activeLegacyCertKeys,
+    };
+  }
+
+  private voiceTarget(device: SavedDevice): VoiceSessionTarget {
+    return { deviceId: device.id, host: device.host };
+  }
+
+  /**
+   * A saved device moved to a new address (rescan or re-save): drop any
+   * connection bound to the old address and point the active device at the
+   * new one so the next command reconnects there.
+   */
+  private applyHostChange(device: SavedDevice, oldHost: string): void {
+    androidTvRemoteBridge.updateHost(device.id, device.host);
+    if (this.activeDevice?.id === device.id) {
+      this.activeDevice = device;
+      void logInfo('adapter', 'Active device moved; the next command reconnects', {
+        deviceId: device.id,
+        oldHost,
+        newHost: device.host,
+      });
+    }
+  }
+
+  /**
+   * State changes for failures that mean the saved pairing can't be used.
+   * A rejected client certificate marks the device unpaired (credentials are
+   * kept: a stale IP answered by another TV must not destroy them). A server
+   * identity mismatch only stops using the connection.
+   */
+  private async handleRemoteFailure(deviceId: string, error: unknown): Promise<void> {
+    if (
+      !(error instanceof CertificateRejectedError) &&
+      !(error instanceof ServerIdentityMismatchError)
+    ) {
+      return;
+    }
+
+    if (this.activeDevice?.id === deviceId) {
+      this.activeDevice = undefined;
+    }
+    this.deviceState = {
+      status: 'error',
+      message: error.message,
+    };
+
+    if (error instanceof CertificateRejectedError) {
+      try {
+        await this.updateSavedDevice(deviceId, (device) => ({ ...device, isPaired: false }));
+      } catch (storeError) {
+        await logError('adapter', 'Could not mark device as unpaired', storeError);
+      }
+    }
   }
 
   async listDevices(): Promise<SavedDevice[]> {
@@ -92,42 +214,37 @@ export class GoogleTvAdapter implements DeviceAdapter {
     const discovered = await discoverGoogleTvDevices();
     await logInfo('adapter', 'Scan complete', { count: discovered.length, devices: discovered });
 
-    const savedDevices = await readDevices();
-    const updatedDevices = savedDevices.map((saved) => {
-      const match = matchSavedToDiscovered(saved, discovered);
-      if (!match) return saved;
-      if (match.host !== saved.host) {
-        void logInfo('adapter', 'Device IP changed — updating host', {
-          deviceId: saved.id,
-          name: saved.name,
-          oldHost: saved.host,
-          newHost: match.host,
-          macAddress: saved.macAddress,
-          castDeviceId: saved.castDeviceId,
-          networkHostName: saved.networkHostName,
-          deviceFingerprint: saved.deviceFingerprint,
+    const hostChanges = await this.withDeviceStore(async (savedDevices) => {
+      const results = savedDevices.map((saved) => {
+        const match = matchSavedToDiscovered(saved, discovered);
+        return { saved, updated: match ? mergeIdentity(saved, match) : saved };
+      });
+      const changes = results
+        .filter(({ saved, updated }) => updated.host !== saved.host)
+        .map(({ saved, updated }) => {
+          void logInfo('adapter', 'Device IP changed — updating host', {
+            deviceId: saved.id,
+            name: saved.name,
+            oldHost: saved.host,
+            newHost: updated.host,
+            macAddress: saved.macAddress,
+            castDeviceId: saved.castDeviceId,
+            networkHostName: saved.networkHostName,
+            deviceFingerprint: saved.deviceFingerprint,
+          });
+          return { device: updated, oldHost: saved.host };
         });
+
+      if (results.some(({ saved, updated }) => identityChanged(saved, updated))) {
+        // Credentials are keyed by device id, so an address change needs no
+        // certificate migration.
+        await writeDevices(results.map(({ updated }) => updated));
       }
-      return mergeIdentity(saved, match);
+      return changes;
     });
 
-    const updatedDevicesChanged = updatedDevices.some((updated, i) =>
-      identityChanged(savedDevices[i], updated)
-    );
-
-    if (updatedDevicesChanged) {
-      await writeDevices(updatedDevices);
-      // Preserve pairing credentials when the TV moves to a new IP.
-      for (let i = 0; i < savedDevices.length; i++) {
-        const old = savedDevices[i];
-        const updated = updatedDevices[i];
-        if (old.host === updated.host) continue;
-        if (updated.macAddress) {
-          await androidTvRemoteBridge.migrateCerts(old.host, updated.macAddress);
-          continue;
-        }
-        await androidTvRemoteBridge.migratePersistedCerts(old.host, updated.host);
-      }
+    for (const { device, oldHost } of hostChanges) {
+      this.applyHostChange(device, oldHost);
     }
 
     return discovered;
@@ -136,16 +253,23 @@ export class GoogleTvAdapter implements DeviceAdapter {
   async saveDevice(draft: DeviceDraft): Promise<SavedDevice[]> {
     if (integrationEnvironment) assertLoopbackHost(draft.host);
     await logInfo('adapter', 'Saving device', { draft });
-    const devices = await readDevices();
 
-    const existingDevice = findExistingForDraft(draft, devices);
-    const nextDevice = normalizeDraft(draft, existingDevice);
+    const { nextDevices, nextDevice, previousHost } = await this.withDeviceStore(
+      async (devices) => {
+        const existingDevice = findExistingForDraft(draft, devices);
+        const saved = normalizeDraft(draft, existingDevice);
+        const next = [...devices.filter((device) => device.id !== existingDevice?.id), saved];
+        await writeDevices(next);
+        return { nextDevices: next, nextDevice: saved, previousHost: existingDevice?.host };
+      }
+    );
 
-    const nextDevices = [
-      ...devices.filter((device) => device.id !== existingDevice?.id),
-      nextDevice,
-    ];
-    await writeDevices(nextDevices);
+    if (previousHost !== undefined && previousHost !== nextDevice.host) {
+      this.applyHostChange(nextDevice, previousHost);
+    } else if (this.activeDevice?.id === nextDevice.id) {
+      this.activeDevice = nextDevice;
+    }
+
     this.deviceState = {
       ...this.deviceState,
       message: `Saved ${nextDevice.name}. Pair once, then connect.`,
@@ -155,14 +279,22 @@ export class GoogleTvAdapter implements DeviceAdapter {
 
   async removeDevice(deviceId: string): Promise<SavedDevice[]> {
     await logInfo('adapter', 'Removing device', { deviceId });
-    const devices = await readDevices();
-    const device = devices.find((item) => item.id === deviceId);
-    if (device) {
-      // Forget authorization before reporting a successful removal or clearing active state.
-      await androidTvRemoteBridge.forgetDevice(device.host, device.macAddress);
-    }
-    const nextDevices = devices.filter((device) => device.id !== deviceId);
-    await writeDevices(nextDevices);
+    const nextDevices = await this.withDeviceStore(async (devices) => {
+      const device = devices.find((item) => item.id === deviceId);
+      if (!device) {
+        return devices;
+      }
+      // Forget authorization before reporting a successful removal or clearing
+      // active state. Legacy MAC/host-keyed files are only removed when no
+      // other saved device could still be using them.
+      await androidTvRemoteBridge.forgetDevice(
+        device.id,
+        forgettableLegacyCertKeys(device, devices)
+      );
+      const remaining = devices.filter((item) => item.id !== deviceId);
+      await writeDevices(remaining);
+      return remaining;
+    });
 
     if (this.activeDevice?.id === deviceId) {
       this.activeDevice = undefined;
@@ -175,14 +307,16 @@ export class GoogleTvAdapter implements DeviceAdapter {
   async resetState(): Promise<DeviceState> {
     await logInfo('adapter', 'Resetting app state');
 
-    this.activeDevice = undefined;
-    await androidTvRemoteBridge.reset();
-    await clearDeviceStore();
+    await this.storeLock.runExclusive(async () => {
+      this.activeDevice = undefined;
+      await androidTvRemoteBridge.reset();
+      await clearDeviceStore();
 
-    for (const userDataPath of getLegacyUserDataPaths()) {
-      await fs.rm(path.join(userDataPath, 'devices.json'), { force: true });
-      await fs.rm(path.join(userDataPath, 'androidtvremote'), { force: true, recursive: true });
-    }
+      for (const userDataPath of getLegacyUserDataPaths()) {
+        await fs.rm(path.join(userDataPath, 'devices.json'), { force: true });
+        await fs.rm(path.join(userDataPath, 'androidtvremote'), { force: true, recursive: true });
+      }
+    });
 
     this.deviceState = {
       ...DEFAULT_STATE,
@@ -193,7 +327,8 @@ export class GoogleTvAdapter implements DeviceAdapter {
   }
 
   async pair(request: PairingRequest): Promise<void> {
-    if (integrationEnvironment) assertLoopbackHost(request.host.trim());
+    const host = request.host.trim();
+    if (integrationEnvironment) assertLoopbackHost(host);
     await logInfo('adapter', 'Starting pairing', { request: { ...request, code: '[redacted]' } });
     this.deviceState = {
       status: 'connecting',
@@ -201,22 +336,20 @@ export class GoogleTvAdapter implements DeviceAdapter {
     };
 
     try {
-      await androidTvRemoteBridge.finishPairing(
-        request.host.trim(),
-        request.code.trim(),
-        request.macAddress
-      );
       const devices = await readDevices();
-      const nextDevices = devices.map((device) =>
-        device.host === request.host.trim()
-          ? {
-              ...device,
-              isPaired: true,
-            }
-          : device
+      const device = request.deviceId
+        ? devices.find((item) => item.id === request.deviceId)
+        : devices.find((item) => item.host.trim() === host);
+      if (!device) {
+        throw new Error('Saved device not found.');
+      }
+
+      await androidTvRemoteBridge.finishPairing(
+        { ...targetFor(device, devices), host },
+        request.code.trim()
       );
-      await writeDevices(nextDevices);
-      await logInfo('adapter', 'Pairing succeeded', { host: request.host });
+      await this.updateSavedDevice(device.id, (item) => ({ ...item, isPaired: true }));
+      await logInfo('adapter', 'Pairing succeeded', { deviceId: device.id, host });
       this.deviceState = {
         status: 'idle',
         message: 'Pairing succeeded. You can connect now.',
@@ -242,7 +375,7 @@ export class GoogleTvAdapter implements DeviceAdapter {
 
     this.activeDevice = undefined;
     try {
-      androidTvRemoteBridge.disconnect(device.host);
+      androidTvRemoteBridge.disconnect(device.id);
     } catch {
       // Ignore disconnect failures before pairing; a stale remote session should not block pairing.
     }
@@ -253,16 +386,11 @@ export class GoogleTvAdapter implements DeviceAdapter {
     };
 
     try {
-      const result = await androidTvRemoteBridge.startPairing(device.host, device.macAddress);
-      const nextDevices = devices.map((item) =>
-        item.id === device.id
-          ? {
-              ...item,
-              macAddress: typeof result?.mac === 'string' ? result.mac : item.macAddress,
-            }
-          : item
-      );
-      await writeDevices(nextDevices);
+      const result = await androidTvRemoteBridge.startPairing(targetFor(device, devices));
+      const mac = typeof result?.mac === 'string' ? result.mac : undefined;
+      if (mac) {
+        await this.updateSavedDevice(device.id, (item) => ({ ...item, macAddress: mac }));
+      }
       this.deviceState = {
         status: 'idle',
         message: `Enter the 6-digit code shown on ${device.name}.`,
@@ -293,19 +421,21 @@ export class GoogleTvAdapter implements DeviceAdapter {
       message: `Connecting to ${device.name}...`,
     };
 
+    const target = targetFor(device, devices);
     try {
-      const result = await androidTvRemoteBridge.connect(device.host, device.macAddress);
-      const nextDevices = devices.map((item) =>
-        item.id === device.id
-          ? {
-              ...item,
-              lastConnectedAt: new Date().toISOString(),
-              macAddress: typeof result?.mac === 'string' ? result.mac : item.macAddress,
-            }
-          : item
-      );
-      await writeDevices(nextDevices);
-      this.activeDevice = nextDevices.find((item) => item.id === device.id);
+      const result = await androidTvRemoteBridge.connect(target);
+      const mac = typeof result?.mac === 'string' ? result.mac : undefined;
+      const connected = await this.updateSavedDevice(device.id, (item) => ({
+        ...item,
+        lastConnectedAt: new Date().toISOString(),
+        macAddress: mac ?? item.macAddress,
+      }));
+      if (!connected) {
+        androidTvRemoteBridge.disconnect(device.id);
+        throw new Error('Saved device not found.');
+      }
+      this.activeDevice = connected;
+      this.activeLegacyCertKeys = target.legacyCertKeys ?? [];
       this.deviceState = {
         status: 'connected',
         activeDeviceId: device.id,
@@ -315,6 +445,7 @@ export class GoogleTvAdapter implements DeviceAdapter {
       return this.deviceState;
     } catch (error) {
       this.activeDevice = undefined;
+      await this.handleRemoteFailure(device.id, error);
       await logError('adapter', 'Connection failed', error);
       this.deviceState = {
         status: 'error',
@@ -332,7 +463,7 @@ export class GoogleTvAdapter implements DeviceAdapter {
     }
 
     try {
-      androidTvRemoteBridge.disconnect(this.activeDevice.host);
+      androidTvRemoteBridge.disconnect(this.activeDevice.id);
     } catch {
       // Ignore disconnect failures so the UI can recover to idle.
     }
@@ -345,13 +476,34 @@ export class GoogleTvAdapter implements DeviceAdapter {
     return this.deviceState;
   }
 
+  /**
+   * Call after the system wakes or the screen unlocks: sockets opened before
+   * sleep are usually half-open, so every remote connection is dropped and
+   * the active device reconnects in the background. Commands sent meanwhile
+   * join that reconnect.
+   */
+  handleSystemResume(): void {
+    const device = this.activeDevice;
+    void logInfo('adapter', 'System resumed; dropping remote connections', {
+      activeDeviceId: device?.id,
+    });
+    androidTvRemoteBridge.dropRemoteClients();
+    if (!device) {
+      return;
+    }
+    androidTvRemoteBridge.connect(this.activeTarget(device)).catch((error: unknown) => {
+      void logError('adapter', 'Background reconnect after resume failed', error);
+    });
+  }
+
   async sendCommand(request: CommandDispatchRequest): Promise<void> {
     commandMetricsStore.recordAdapterDispatchStart(request, {
       deviceId: this.activeDevice?.id,
       host: this.activeDevice?.host,
     });
 
-    if (!this.activeDevice) {
+    const device = this.activeDevice;
+    if (!device) {
       const errorMessage = 'No active device connected.';
       commandMetricsStore.recordCommandFailed(request, {
         reason: 'no_active_device',
@@ -360,75 +512,60 @@ export class GoogleTvAdapter implements DeviceAdapter {
       throw new Error(errorMessage);
     }
 
-    await androidTvRemoteBridge.sendCommand(
-      this.activeDevice.host,
-      request,
-      this.activeDevice.macAddress
-    );
+    try {
+      await androidTvRemoteBridge.sendCommand(this.activeTarget(device), request);
+    } catch (error) {
+      await this.handleRemoteFailure(device.id, error);
+      throw error;
+    }
     commandMetricsStore.recordAdapterDispatchCompleted(request.id);
   }
 
   async sendText(text: string): Promise<void> {
-    if (!this.activeDevice) {
-      throw new Error('No active device connected.');
+    const device = this.requireActiveDevice();
+    try {
+      await androidTvRemoteBridge.sendText(this.activeTarget(device), text);
+    } catch (error) {
+      await this.handleRemoteFailure(device.id, error);
+      throw error;
     }
-
-    await androidTvRemoteBridge.sendText(
-      this.activeDevice.host,
-      text,
-      this.activeDevice.macAddress
-    );
   }
 
   async startAssistantVoice(): Promise<number> {
-    if (!this.activeDevice) {
-      throw new Error('No active device connected.');
+    const device = this.requireActiveDevice();
+    try {
+      return await this.voiceSessions.start(this.voiceTarget(device));
+    } catch (error) {
+      await this.handleRemoteFailure(device.id, error);
+      throw error;
     }
-    return this.voiceSessions.start({
-      deviceId: this.activeDevice.id,
-      host: this.activeDevice.host,
-      macAddress: this.activeDevice.macAddress,
-    });
   }
 
   async sendAssistantVoiceChunk(sessionId: number, chunkBase64: string): Promise<void> {
-    if (!this.activeDevice) {
-      throw new Error('No active device connected.');
+    const device = this.requireActiveDevice();
+    try {
+      await this.voiceSessions.sendChunk(this.voiceTarget(device), sessionId, chunkBase64);
+    } catch (error) {
+      await this.handleRemoteFailure(device.id, error);
+      throw error;
     }
-    await this.voiceSessions.sendChunk(
-      {
-        deviceId: this.activeDevice.id,
-        host: this.activeDevice.host,
-        macAddress: this.activeDevice.macAddress,
-      },
-      sessionId,
-      chunkBase64
-    );
   }
 
   async stopAssistantVoice(sessionId: number): Promise<void> {
-    if (!this.activeDevice) {
-      throw new Error('No active device connected.');
+    const device = this.requireActiveDevice();
+    try {
+      await this.voiceSessions.stop(this.voiceTarget(device), sessionId);
+    } catch (error) {
+      await this.handleRemoteFailure(device.id, error);
+      throw error;
     }
-    await this.voiceSessions.stop(
-      {
-        deviceId: this.activeDevice.id,
-        host: this.activeDevice.host,
-        macAddress: this.activeDevice.macAddress,
-      },
-      sessionId
-    );
   }
 
   async hasPendingAssistantVoiceSession(): Promise<boolean> {
     if (!this.activeDevice) {
       return false;
     }
-    return this.voiceSessions.hasPending({
-      deviceId: this.activeDevice.id,
-      host: this.activeDevice.host,
-      macAddress: this.activeDevice.macAddress,
-    });
+    return this.voiceSessions.hasPending(this.voiceTarget(this.activeDevice));
   }
 
   getCapabilities(): Promise<DeviceCapabilities> {
@@ -443,5 +580,12 @@ export class GoogleTvAdapter implements DeviceAdapter {
       devices: await readDevices(),
       deviceState: this.deviceState,
     };
+  }
+
+  private requireActiveDevice(): SavedDevice {
+    if (!this.activeDevice) {
+      throw new Error('No active device connected.');
+    }
+    return this.activeDevice;
   }
 }

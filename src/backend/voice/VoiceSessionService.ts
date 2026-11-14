@@ -23,24 +23,28 @@ import type { IClock } from '../core/clock';
 import type { ILogger } from '../core/logger';
 
 export interface VoiceSessionTarget {
-  /** Stable id of the device the caller has resolved (used in log details). */
+  /**
+   * Stable id of the saved device. The transport keys its connection and
+   * credentials by this id, never by host.
+   */
   deviceId: string;
-  /** Network host of the device. */
+  /** Network host of the device (where to connect; also used in logs). */
   host: string;
-  /** Optional MAC, used by the transport to disambiguate cert keys. */
+  /** @deprecated Ignored; transports key sessions by `deviceId`. */
   macAddress?: string;
 }
 
 /**
  * The "lower half" of the voice session — the four operations performed
  * against a connected transport. In production this is implemented by
- * `androidTvRemoteBridge`; in tests by an in-memory fake.
+ * `androidTvRemoteBridge`; in tests by an in-memory fake. `deviceId` selects
+ * the device's session; `host` is only where to connect if it must.
  */
 export interface IVoiceTransport {
-  start(host: string, macAddress?: string): Promise<number>;
-  sendChunk(host: string, sessionId: number, chunk: Buffer, macAddress?: string): Promise<void>;
-  stop(host: string, sessionId: number, macAddress?: string): Promise<void>;
-  hasPending(host: string, macAddress?: string): Promise<boolean>;
+  start(host: string, deviceId: string): Promise<number>;
+  sendChunk(host: string, sessionId: number, chunk: Buffer, deviceId: string): Promise<void>;
+  stop(host: string, sessionId: number, deviceId: string): Promise<void>;
+  hasPending(host: string, deviceId: string): Promise<boolean>;
 }
 
 interface SessionStats {
@@ -65,7 +69,7 @@ export class VoiceSessionService {
   /** Begin a voice session for the given device. Returns the transport's
    * session id, which the caller must echo back on chunk / stop. */
   async start(target: VoiceSessionTarget): Promise<number> {
-    const sessionId = await this.transport.start(target.host, target.macAddress);
+    const sessionId = await this.transport.start(target.host, target.deviceId);
     // ILogger is synchronous-by-contract — no await.
     this.logger.info('adapter', 'Assistant voice session started', {
       deviceId: target.deviceId,
@@ -91,7 +95,7 @@ export class VoiceSessionService {
     chunkBase64: string
   ): Promise<void> {
     const chunk = Buffer.from(chunkBase64, 'base64');
-    await this.transport.sendChunk(target.host, sessionId, chunk, target.macAddress);
+    await this.transport.sendChunk(target.host, sessionId, chunk, target.deviceId);
 
     const stats = this.stats.get(sessionId);
     if (stats) {
@@ -116,11 +120,17 @@ export class VoiceSessionService {
     }
   }
 
-  /** Stop the session and emit a summary log line (chunks / bytes / duration). */
+  /**
+   * Stop the session and emit a summary log line (chunks / bytes / duration).
+   * The session's stats are released even when the transport stop fails.
+   */
   async stop(target: VoiceSessionTarget, sessionId: number): Promise<void> {
-    await this.transport.stop(target.host, sessionId, target.macAddress);
     const stats = this.stats.get(sessionId);
-    this.stats.delete(sessionId);
+    try {
+      await this.transport.stop(target.host, sessionId, target.deviceId);
+    } finally {
+      this.stats.delete(sessionId);
+    }
     this.logger.info('adapter', 'Assistant voice session ended', {
       deviceId: target.deviceId,
       host: target.host,
@@ -133,7 +143,7 @@ export class VoiceSessionService {
 
   /** Whether the transport reports any pending session for the target. */
   async hasPending(target: VoiceSessionTarget): Promise<boolean> {
-    return this.transport.hasPending(target.host, target.macAddress);
+    return this.transport.hasPending(target.host, target.deviceId);
   }
 
   /** TEST-ONLY: peek tracked sessions. */

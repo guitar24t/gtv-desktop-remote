@@ -4,6 +4,7 @@ import { CommandMetricsStore } from '../../../src/main/metrics';
 import type { CommandDispatchRequest } from '../../../src/shared/types';
 
 vi.mock('electron', () => ({ app: { isPackaged: false } }));
+vi.mock('../../../src/main/logger', () => ({ logInfo: vi.fn(() => Promise.resolve()) }));
 
 describe('CommandMetricsStore bounded retention', () => {
   const request = (id: string): CommandDispatchRequest => ({
@@ -133,5 +134,46 @@ describe('CommandMetricsStore bounded retention', () => {
     expect(store.getSnapshot().recentCommands.every((record) => record.status === 'sent')).toBe(
       true
     );
+  });
+});
+
+describe('CommandMetricsStore warning dedupe bound', () => {
+  const request = (id: string): CommandDispatchRequest => ({
+    id,
+    command: 'right',
+    source: 'keyboard',
+    issuedAt: 1_000,
+  });
+  const buffered = { host: 'tv', buffered: true };
+
+  it('still deduplicates within the window but never grows without bound', () => {
+    let now = 10_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = new CommandMetricsStore();
+    const dedupeKeys = () =>
+      (store as unknown as { warningTimestamps: Map<string, number> }).warningTimestamps;
+
+    const first = request('buffered-0');
+    store.recordSocketWrite(first, buffered);
+    store.recordSocketWrite(first, buffered);
+    expect(store.getSnapshot().counters.stallWarnings).toBe(1);
+
+    // Warning keys include the command id, so a long session produces endless unique keys.
+    for (let index = 1; index <= 5_000; index += 1) {
+      store.recordSocketWrite(request(`buffered-${String(index)}`), buffered);
+    }
+    expect(store.getSnapshot().counters.stallWarnings).toBe(5_001);
+    expect(dedupeKeys().size).toBeLessThanOrEqual(256);
+
+    // Once the window has passed, stale keys are pruned on the next warning...
+    now += 15_000;
+    store.recordSocketWrite(request('late'), buffered);
+    expect(dedupeKeys().size).toBe(1);
+
+    // ...and the earlier key can warn again.
+    store.recordSocketWrite(first, buffered);
+    expect(store.getSnapshot().counters.stallWarnings).toBe(5_003);
+    store.recordSocketWrite(first, buffered);
+    expect(store.getSnapshot().counters.stallWarnings).toBe(5_003);
   });
 });

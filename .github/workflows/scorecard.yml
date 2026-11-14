@@ -9,11 +9,15 @@ permissions:
 jobs:
   analysis:
     permissions:
+      actions: read
+      contents: read
       id-token: write
       security-events: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ossf/scorecard-action@v2.5.0
         with:
           results_file: results.sarif

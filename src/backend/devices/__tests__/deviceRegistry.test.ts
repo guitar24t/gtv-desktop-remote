@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import type { DeviceDraft, DiscoveredDevice, SavedDevice } from '../../../shared/types';
 import {
   findExistingForDraft,
+  forgettableLegacyCertKeys,
   identityChanged,
+  legacyCertKeysFor,
   matchSavedToDiscovered,
   mergeIdentity,
   normalizeDraft,
@@ -266,5 +268,44 @@ describe('normalizeDraft', () => {
     const result = normalizeDraft(draft(), existing, () => 'id');
     expect(result.macAddress).toBe('OLD');
     expect(result.castDeviceId).toBe('OLD-CAST');
+  });
+});
+
+describe('legacyCertKeysFor', () => {
+  it('offers the MAC key first, then the host key', () => {
+    const device = saved({ id: 'a', macAddress: 'AA:BB:CC:DD:EE:01' });
+    expect(legacyCertKeysFor(device, [device])).toEqual(['AA:BB:CC:DD:EE:01', '192.168.1.5']);
+  });
+
+  it('offers only the host key when the MAC is unknown', () => {
+    const device = saved({ id: 'a' });
+    expect(legacyCertKeysFor(device, [device])).toEqual(['192.168.1.5']);
+  });
+
+  it('withholds the host key when another saved device has the same host', () => {
+    const a = saved({ id: 'a', macAddress: 'AA:BB:CC:DD:EE:01' });
+    const b = saved({ id: 'b', host: ' 192.168.1.5 ' });
+    expect(legacyCertKeysFor(a, [a, b])).toEqual(['AA:BB:CC:DD:EE:01']);
+    expect(legacyCertKeysFor(b, [a, b])).toEqual([]);
+  });
+});
+
+describe('forgettableLegacyCertKeys', () => {
+  it('returns MAC and host keys that no other saved device shares', () => {
+    const a = saved({ id: 'a', macAddress: 'AA:BB:CC:DD:EE:01' });
+    const b = saved({ id: 'b', host: '192.168.1.9', macAddress: 'AA:BB:CC:DD:EE:02' });
+    expect(forgettableLegacyCertKeys(a, [a, b])).toEqual(['AA:BB:CC:DD:EE:01', '192.168.1.5']);
+  });
+
+  it('keeps a host key another saved device still has', () => {
+    const a = saved({ id: 'a', macAddress: 'AA:BB:CC:DD:EE:01' });
+    const b = saved({ id: 'b' });
+    expect(forgettableLegacyCertKeys(a, [a, b])).toEqual(['AA:BB:CC:DD:EE:01']);
+  });
+
+  it('keeps a MAC key another saved device shares (case-insensitively)', () => {
+    const a = saved({ id: 'a', macAddress: 'AA:BB:CC:DD:EE:01' });
+    const b = saved({ id: 'b', host: '192.168.1.9', macAddress: 'aa:bb:cc:dd:ee:01' });
+    expect(forgettableLegacyCertKeys(a, [a, b])).toEqual(['192.168.1.5']);
   });
 });

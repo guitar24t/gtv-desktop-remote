@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { AppPreferences } from '../shared/preferences';
 
 import { getDesktopApi } from './api';
-import { recordedShortcut, shortcutLabel, shortcutModifiers } from './lib/shortcut';
+import { modifierForKey, recordedShortcut, shortcutLabel, shortcutModifiers } from './lib/shortcut';
 
 interface ShortcutRecorderProps {
   shortcut: string;
@@ -21,7 +21,12 @@ export function ShortcutRecorder(props: ShortcutRecorderProps) {
   const session = useRef(false);
   const ready = useRef(false);
   const ending = useRef(false);
-  const candidate = useRef<{ shortcut: string; code: string; key: string } | null>(null);
+  const candidate = useRef<{
+    shortcut: string;
+    code: string;
+    key: string;
+    modifiers: string[];
+  } | null>(null);
   const button = useRef<HTMLButtonElement>(null);
   const tabDirection = useRef<1 | -1 | null>(null);
   const [recording, setRecording] = useState(false);
@@ -192,7 +197,12 @@ export function ShortcutRecorder(props: ShortcutRecorderProps) {
             );
             return;
           }
-          candidate.current = { shortcut, code: event.code, key: event.key };
+          candidate.current = {
+            shortcut,
+            code: event.code,
+            key: event.key,
+            modifiers: shortcutModifiers(event.nativeEvent),
+          };
           setPreview(shortcutLabel(shortcut));
           setFeedback('Release keys to finish recording. Escape cancels.');
         }}
@@ -205,7 +215,12 @@ export function ShortcutRecorder(props: ShortcutRecorderProps) {
             const matches = captured.code
               ? event.code === captured.code
               : event.key.toLowerCase() === captured.key.toLowerCase();
-            if (matches) void finish(captured.shortcut);
+            // macOS Chromium sends no keyup for a key pressed while Cmd is held, so
+            // releasing any modifier of the captured chord also finishes recording.
+            const modifier = modifierForKey(event.key);
+            if (matches || (modifier !== null && captured.modifiers.includes(modifier))) {
+              void finish(captured.shortcut);
+            }
             return;
           }
           if (ready.current && ['Control', 'Alt', 'Shift', 'Meta'].includes(event.key)) {

@@ -1,7 +1,10 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
 import type { DesktopApi } from '../shared/desktopApi';
-import { EVENT_CHANNELS, INVOKE_CHANNELS } from '../shared/ipcContract';
+import type {
+  EVENT_CHANNELS as ContractEventChannels,
+  INVOKE_CHANNELS as ContractInvokeChannels,
+} from '../shared/ipcContract';
 import type { AppPreferences, PreferenceChange, PreferenceResult } from '../shared/preferences';
 import type {
   BootstrapState,
@@ -16,6 +19,42 @@ import type {
   SavedDevice,
   UpdaterStatus,
 } from '../shared/types';
+
+// The window runs with `sandbox: true`, where a preload may only require Electron's
+// renderer modules. Channel names are therefore mirrored here instead of imported;
+// typing them as the shared contract makes any drift a compile error.
+const INVOKE_CHANNELS: typeof ContractInvokeChannels = {
+  preferencesGet: 'preferences:get',
+  preferencesChange: 'preferences:change',
+  preferencesShortcutCapture: 'preferences:shortcutCapture',
+  deviceBootstrap: 'device:bootstrap',
+  deviceScan: 'device:scan',
+  deviceSave: 'device:save',
+  deviceRemove: 'device:remove',
+  deviceReset: 'device:reset',
+  deviceStartPairing: 'device:startPairing',
+  devicePair: 'device:pair',
+  deviceConnect: 'device:connect',
+  deviceDisconnect: 'device:disconnect',
+  deviceCommand: 'device:command',
+  deviceText: 'device:text',
+  deviceCapabilities: 'device:capabilities',
+  deviceAssistantVoiceStart: 'device:assistantVoiceStart',
+  deviceAssistantVoiceChunk: 'device:assistantVoiceChunk',
+  deviceAssistantVoiceStop: 'device:assistantVoiceStop',
+  deviceAssistantVoicePending: 'device:assistantVoicePending',
+  metricsRendererDrop: 'metrics:rendererDrop',
+  metricsSnapshot: 'metrics:snapshot',
+  updaterCheck: 'updater:check',
+  updaterCheckBackground: 'updater:checkBackground',
+  updaterStatus: 'updater:status',
+  updaterInstall: 'updater:install',
+  updaterRollback: 'updater:rollback',
+};
+
+const EVENT_CHANNELS: typeof ContractEventChannels = {
+  updaterStatusChanged: 'updater:statusChanged',
+};
 
 const api = {
   getPreferences: (): Promise<AppPreferences> => ipcRenderer.invoke(INVOKE_CHANNELS.preferencesGet),

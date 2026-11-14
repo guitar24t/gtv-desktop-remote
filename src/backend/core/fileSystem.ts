@@ -11,7 +11,12 @@ import { promises as fsPromises } from 'node:fs';
 
 export interface IFileSystem {
   readFile(filePath: string, encoding: 'utf8'): Promise<string>;
-  writeFile(filePath: string, contents: string, encoding: 'utf8'): Promise<void>;
+  /**
+   * Write `contents` to `filePath`. When `mode` is given (e.g. `0o600` for
+   * private keys) the file is created with — and, if it already existed,
+   * changed to — that permission mode.
+   */
+  writeFile(filePath: string, contents: string, encoding: 'utf8', mode?: number): Promise<void>;
   mkdir(dirPath: string, options: { recursive: true }): Promise<void>;
   /** Best-effort delete; never throws on ENOENT. */
   rm(filePath: string, options: { force: true }): Promise<void>;
@@ -30,7 +35,15 @@ export interface IFileSystem {
 export function createNodeFileSystem(): IFileSystem {
   return {
     readFile: (filePath, encoding) => fsPromises.readFile(filePath, encoding),
-    writeFile: (filePath, contents, encoding) => fsPromises.writeFile(filePath, contents, encoding),
+    writeFile: async (filePath, contents, encoding, mode) => {
+      if (mode === undefined) {
+        await fsPromises.writeFile(filePath, contents, encoding);
+        return;
+      }
+      await fsPromises.writeFile(filePath, contents, { encoding, mode });
+      // `mode` only applies on creation and is filtered by the umask.
+      await fsPromises.chmod(filePath, mode);
+    },
     mkdir: async (dirPath, options) => {
       await fsPromises.mkdir(dirPath, options);
     },

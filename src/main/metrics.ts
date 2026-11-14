@@ -21,6 +21,8 @@ import { logInfo } from './logger';
 const MAX_RECENT_COMMANDS = 40;
 const MAX_WARNINGS = 12;
 const WARNING_DEDUP_MS = 15_000;
+/** Upper bound on remembered warning keys (keys include command ids, so they never repeat). */
+const MAX_WARNING_DEDUP_KEYS = 256;
 const CONNECT_STALL_MS = 15_000;
 const SEND_STALL_MS = 15_000;
 const INBOUND_STALL_MS = 45_000;
@@ -441,10 +443,28 @@ export class CommandMetricsStore implements IMetricsRecorder {
       return;
     }
 
-    this.warningTimestamps.set(dedupeKey, warning.createdAt);
+    this.rememberWarning(dedupeKey, warning.createdAt);
     this.warnings = [warning, ...this.warnings].slice(0, MAX_WARNINGS);
     this.counters.stallWarnings += 1;
     this.logMetric('warning', { ...warning });
+  }
+
+  /**
+   * Record when a warning key last fired. Entries older than the dedupe window
+   * can no longer suppress anything, so they are pruned; the map is also capped
+   * so a burst of unique keys within one window stays bounded. Re-inserting on
+   * every hit keeps Map iteration order oldest-first.
+   */
+  private rememberWarning(dedupeKey: string, createdAt: number): void {
+    this.warningTimestamps.delete(dedupeKey);
+    this.warningTimestamps.set(dedupeKey, createdAt);
+    for (const [key, timestamp] of this.warningTimestamps) {
+      const expired = createdAt - timestamp >= WARNING_DEDUP_MS;
+      if (!expired && this.warningTimestamps.size <= MAX_WARNING_DEDUP_KEYS) {
+        break;
+      }
+      this.warningTimestamps.delete(key);
+    }
   }
 
   private logMetric(event: string, details: Record<string, unknown>): void {

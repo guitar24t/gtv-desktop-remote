@@ -33,6 +33,26 @@ export function shortcutModifiers(event: ShortcutKey): string[] {
   ].filter((value): value is string => value !== null);
 }
 
+/**
+ * Maps a modifier key's `KeyboardEvent.key` to the accelerator modifier name
+ * used by `shortcutModifiers`, or null for a non-modifier key.
+ */
+export function modifierForKey(key: string): string | null {
+  switch (key) {
+    case 'Control':
+      return 'Control';
+    case 'Alt':
+      return 'Alt';
+    case 'Shift':
+      return 'Shift';
+    case 'Meta':
+    case 'OS':
+      return 'Super';
+    default:
+      return null;
+  }
+}
+
 export function recordedShortcut(event: ShortcutKey, mac = isMacPlatform()): string | null {
   if (event.isComposing || ['Process', 'Unidentified'].includes(event.key)) return null;
   let key = event.key;

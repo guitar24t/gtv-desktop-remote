@@ -1,8 +1,27 @@
 #!/usr/bin/env node
 
-const DEFAULT_REPOSITORY = 'usrivastava92/gtv-desktop-remote';
+import { readFileSync } from 'node:fs';
+
 const CASK_TOKEN = 'gtv-desktop-remote';
 const APP_NAME = 'GTV Remote.app';
+const REPOSITORY_PATTERN = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+
+/**
+ * Default `owner/repo` for download URLs: the repository package.json points
+ * at (the same one semantic-release publishes to), so a fork never renders a
+ * cask that downloads someone else's build.
+ */
+function defaultRepository(
+  packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+) {
+  const repository = packageJson.repository;
+  const url = typeof repository === 'string' ? repository : repository?.url;
+  const match = /github\.com[/:]([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/.exec(url ?? '');
+  if (!match) {
+    throw new Error('package.json repository.url is not a GitHub repository; pass --repository.');
+  }
+  return `${match[1]}/${match[2]}`;
+}
 
 function parseArgs(argv) {
   const args = {};
@@ -110,10 +129,28 @@ ${renderSharedBody(repository)}end
 `;
 }
 
-try {
+function validate({ version, repository, sha256s, artifactNames }) {
+  // Values are interpolated into Ruby string literals; reject anything unexpected.
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error(`Invalid --version: ${version}`);
+  }
+  if (!REPOSITORY_PATTERN.test(repository)) {
+    throw new Error(`Invalid --repository (expected owner/repo): ${repository}`);
+  }
+  for (const sha256 of sha256s) {
+    if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error(`Invalid sha256: ${sha256}`);
+  }
+  for (const name of artifactNames) {
+    if (/["\\#{}\n]/.test(name) || name.includes('/')) {
+      throw new Error(`Invalid artifact name: ${name}`);
+    }
+  }
+}
+
+function main() {
   const args = parseArgs(process.argv.slice(2));
   const version = requireArg(args, 'version');
-  const repository = args.repository || DEFAULT_REPOSITORY;
+  const repository = args.repository || defaultRepository();
 
   const dualArch =
     args['sha256-arm64'] &&
@@ -122,6 +159,12 @@ try {
     args['artifact-name-x64'];
 
   if (dualArch) {
+    validate({
+      version,
+      repository,
+      sha256s: [args['sha256-arm64'], args['sha256-x64']],
+      artifactNames: [args['artifact-name-arm64'], args['artifact-name-x64']],
+    });
     process.stdout.write(
       renderDualArchCask({
         version,
@@ -136,8 +179,13 @@ try {
     // Legacy single-arch path: exactly one DMG asset.
     const sha256 = requireArg(args, 'sha256');
     const artifactName = requireArg(args, 'artifact-name');
+    validate({ version, repository, sha256s: [sha256], artifactNames: [artifactName] });
     process.stdout.write(renderSingleArchCask({ version, sha256, artifactName, repository }));
   }
+}
+
+try {
+  main();
 } catch (error) {
   console.error(error.message);
   console.error(

@@ -7,7 +7,7 @@
   "main": "dist-electron/main/main.js",
   "repository": {
     "type": "git",
-    "url": "https://github.com/usrivastava92/gtv-desktop-remote.git"
+    "url": "https://github.com/guitar24t/gtv-desktop-remote.git"
   },
   "author": "",
   "license": "MIT",
