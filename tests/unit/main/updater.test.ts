@@ -654,6 +654,19 @@ describe('background check debounce', () => {
     expect(count('/latest')).toBe(2);
   });
 
+  it('treats "no release published yet" (404) as up to date, not a failure', async () => {
+    const updater = await setup({ latestStatus: 404 });
+
+    const status = await updater.checkForUpdatesInBackground();
+    expect(status.stage).toBe('completed');
+    expect(status.updateAvailable).not.toBe(true);
+    expect(status.message).toMatch(/No releases have been published yet/);
+    // A completed check waits the normal 15 minutes, not the 5-minute failure back-off.
+    vi.setSystemTime(T0 + 6 * MINUTE);
+    await updater.checkForUpdatesInBackground();
+    expect(count('/latest')).toBe(1);
+  });
+
   it('waits for the GitHub rate-limit reset after a rate-limited check', async () => {
     const updater = await setup({
       latestStatus: 403,

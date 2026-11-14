@@ -391,6 +391,14 @@ class GitHubRateLimitError extends Error {
   }
 }
 
+/** GitHub answered 404, e.g. for /releases/latest before any release is published. */
+class GitHubNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GitHubNotFoundError';
+  }
+}
+
 async function requestJson<T>(url: string): Promise<T> {
   const controller = new AbortController();
   if (integrationEnvironment) assertLoopbackUrl(url);
@@ -432,6 +440,9 @@ async function requestJson<T>(url: string): Promise<T> {
         );
       }
 
+      if (response.status === 404) {
+        throw new GitHubNotFoundError(`GitHub API returned 404 for ${url}`);
+      }
       throw new Error(`GitHub API failed: ${String(response.status)} ${response.statusText}`);
     }
 
@@ -894,9 +905,28 @@ async function checkForMacUpdate() {
     return;
   }
 
-  const release = await requestJson<unknown>(
-    integrationEnvironment?.updater?.releaseApiUrl ?? latestReleaseApiUrl()
-  );
+  const releaseUrl = integrationEnvironment?.updater?.releaseApiUrl ?? latestReleaseApiUrl();
+  let release: unknown;
+  try {
+    release = await requestJson<unknown>(releaseUrl);
+  } catch (error) {
+    if (!(error instanceof GitHubNotFoundError)) throw error;
+    // GitHub answers 404 for /releases/latest until the first release is
+    // published (it would also do so for a wrong repository, hence the log).
+    await logInfo('updater', 'No published release found; treating as up to date', {
+      url: releaseUrl,
+    });
+    const currentVersion = normalizeVersion(updaterVersion());
+    cachedRelease = undefined;
+    cachedAsset = undefined;
+    dispatchUpdaterEvent({
+      type: 'check-completed-no-update',
+      latestVersion: currentVersion,
+      lastCheckedAt: new Date().toISOString(),
+      message: `No releases have been published yet. You're on ${currentVersion}.`,
+    });
+    return;
+  }
   assertReleasePayload(release);
 
   const latestVersion = normalizeVersion(release.tag_name);
